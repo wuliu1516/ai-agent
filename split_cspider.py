@@ -1,13 +1,14 @@
 """Create database-disjoint development, validation, and test CSpider sets."""
 
 import json
+import os
 import random
 import shutil
 from collections import defaultdict
 from pathlib import Path
 
 
-SOURCE = Path(r"D:\dataset\CSpider")
+SOURCE = Path(os.environ.get("CSPIDER_SOURCE_DIR", r"D:\dataset\CSpider"))
 DESTINATION = Path(__file__).resolve().parent / "data" / "CSpider"
 SEED = 42
 VALIDATION_FRACTION = 0.10

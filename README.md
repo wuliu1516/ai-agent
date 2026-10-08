@@ -4,24 +4,36 @@
 
 ## 启动
 
-Windows 复现环境固定使用 Python 3.12.4、Node.js 24.19.0 和 npm 11.17.0。请先安装这些版本，并将原始 CSpider 数据放在 `D:\dataset\CSpider`。该目录应包含 `train.json`、`train_gold.sql`、`dev.json`、`dev_gold.sql`、`tables.json`、`char_emb.txt`、`README.txt` 和 `database`。
+Windows 环境由 CMake/Ninja 统一封装。首次使用需要安装 **CMake 4.4+**、**Ninja**、**Python 3.12.4**、**Node.js 24.x** 和 **npm 11.x**；项目数据默认从 `D:\dataset\CSpider` 读取。该目录应包含 `train.json`、`train_gold.sql`、`dev.json`、`dev_gold.sql`、`tables.json`、`char_emb.txt`、`README.txt` 和 `database`。
 
 ```powershell
-# 在仓库根目录执行；会创建 .venv、安装锁定依赖、执行 split_cspider.py
-.\setup.ps1
+# 在仓库根目录执行。配置任务运行器；生成器固定为 Ninja。
+cmake -S . -B build -G Ninja
 
-# 启动前后端，按 Ctrl+C 停止
-.\run.ps1
+# 创建 .venv、安装锁定的 Python/Node 依赖，并生成 data/CSpider 划分。
+cmake --build build --target setup
+
+# 后台启动 FastAPI 和 Vite，并等待健康检查通过。
+cmake --build build --target start
 ```
 
-如果 PowerShell 当前执行策略不允许运行本地脚本，可在仓库根目录执行：
+服务启动后：
+
+- 工作台：[http://127.0.0.1:5173](http://127.0.0.1:5173)
+- 后端接口文档：[http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+常用任务：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\setup.ps1
+# 只安装 Python/前端依赖，不重新生成数据划分。
+cmake --build build --target setup-deps
+
+# 查看前后端状态；停止本工作台的 5173/8000 监听服务。
+cmake --build build --target status
+cmake --build build --target stop
 ```
 
-只需更新 Python 和前端依赖、不重新生成数据划分时，执行 `.\setup.ps1 -SkipDataSplit`。浏览器打开 `http://127.0.0.1:5173`；后端接口文档位于 `http://127.0.0.1:8000/docs`。
-
+`setup.ps1` 和 `run.ps1` 仍可使用，现已改为上述 CMake target 的兼容包装器（`setup.ps1 -SkipDataSplit` 对应 `setup-deps`）。CMake 会校验 Python 3.12.4、Node.js 24.x、npm 11.x；如数据目录不在默认位置，请在首次配置时指定 `-DCSPIDER_DATA_SOURCE_DIR=<路径>`。
 ## 页面功能
 
 - 开发集、验证集、测试集样本列表与问题搜索。

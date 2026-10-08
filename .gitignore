@@ -6,4 +6,5 @@ backend/storage/*.sqlite3
 .env.*
 !.env.example
 .venv
-data
+data/
+build/
