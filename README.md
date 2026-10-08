@@ -4,22 +4,23 @@
 
 ## 启动
 
-需要 Python 3.10+ 和 Node.js 18+。在仓库根目录启动后端。
+Windows 复现环境固定使用 Python 3.12.4、Node.js 24.19.0 和 npm 11.17.0。请先安装这些版本，并将原始 CSpider 数据放在 `D:\dataset\CSpider`。该目录应包含 `train.json`、`train_gold.sql`、`dev.json`、`dev_gold.sql`、`tables.json`、`char_emb.txt`、`README.txt` 和 `database`。
 
 ```powershell
-python -m pip install -r backend/requirements.txt
-python -m uvicorn backend.main:app --reload --port 8000
+# 在仓库根目录执行；会创建 .venv、安装锁定依赖、执行 split_cspider.py
+.\setup.ps1
+
+# 启动前后端，按 Ctrl+C 停止
+.\run.ps1
 ```
 
-另开一个终端：
+如果 PowerShell 当前执行策略不允许运行本地脚本，可在仓库根目录执行：
 
 ```powershell
-cd frontend
-npm install
-npm run dev
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
 ```
 
-浏览器打开 `http://127.0.0.1:5173`。后端接口文档位于 `http://127.0.0.1:8000/docs`。
+只需更新 Python 和前端依赖、不重新生成数据划分时，执行 `.\setup.ps1 -SkipDataSplit`。浏览器打开 `http://127.0.0.1:5173`；后端接口文档位于 `http://127.0.0.1:8000/docs`。
 
 ## 页面功能
 
