@@ -48,8 +48,10 @@ CORS_ORIGINS = [
 API_BASE_URL = os.environ.get("NL2SQL_API_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 API_KEY = os.environ.get("NL2SQL_API_KEY", "").strip()
 DEFAULT_MODEL = os.environ.get("NL2SQL_MODEL", "").strip()
+DISABLE_THINKING = os.environ.get("NL2SQL_DISABLE_THINKING", "false").strip().lower() in {"1", "true", "yes", "on"}
 MAX_EXPERIMENT_SAMPLES = 10_000
 MAX_GENERATION_CONCURRENCY = 6
+MAX_CONSECUTIVE_MODEL_FAILURES = 3
 MAX_EVAL_ROWS = 5_000
 MAX_EVAL_SECONDS = 8
 RESULT_PREVIEW_ROWS = 12
@@ -59,7 +61,8 @@ BASELINE_SYSTEM_PROMPT = """你是一个严谨的 Text-to-SQL 助手。请根据
 1. 只使用提供的表名和字段名，不要臆造数据库结构。
 2. 表之间需要关联时，优先遵循 schema 中给出的外键关系。
 3. 使用 SQLite 方言，生成一条只读 SELECT 查询（允许 WITH ... SELECT）。
-4. 只输出 SQL，不要解释、不要 Markdown 代码围栏，也不要输出多条语句。"""
+4. 最终答复只能是一条 SQL 语句；不要输出推理过程、分析说明或任何 <think> / </think> 标记。
+5. 不要使用 Markdown 代码围栏，不要添加“SQL:”等前后缀文字，也不要输出多条语句。"""
 
 
 def public_table_count(schema: dict[str, Any]) -> int:
@@ -457,27 +460,29 @@ def retry_delay(error: urllib.error.HTTPError, attempt: int) -> float:
 
 
 def call_chat_completion(model: str, system_prompt: str, user_prompt: str) -> str:
-    if not API_KEY:
-        raise RuntimeError("未配置 NL2SQL_API_KEY，请在 backend/.env 中配置后重启后端")
     parsed_base_url = urlsplit(API_BASE_URL)
     endpoint_path = parsed_base_url.path.rstrip("/")
     if not endpoint_path.endswith("/chat/completions"):
         endpoint_path += "/chat/completions"
     endpoint = urlunsplit((parsed_base_url.scheme, parsed_base_url.netloc, endpoint_path, "", ""))
-    request_body = json.dumps(
-        {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            **GENERATION_PARAMS,
-        }
-    ).encode("utf-8")
+    request_payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        **GENERATION_PARAMS,
+    }
+    if DISABLE_THINKING:
+        request_payload["chat_template_kwargs"] = {"enable_thinking": False}
+    request_body = json.dumps(request_payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if API_KEY:
+        headers["Authorization"] = f"Bearer {API_KEY}"
     request = urllib.request.Request(
         endpoint,
         data=request_body,
-        headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     payload = None
@@ -517,6 +522,10 @@ def call_chat_completion(model: str, system_prompt: str, user_prompt: str) -> st
             str(part.get("text", "")) for part in content if isinstance(part, dict)
         )
     text = str(content or "").strip()
+    thinking_ends = list(re.finditer(r"</think\s*>", text, flags=re.IGNORECASE))
+    if thinking_ends:
+        text = text[thinking_ends[-1].end():].strip()
+    text = re.sub(r"</?think\b[^>]*>", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"^```(?:sql)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
     if not text:
         raise RuntimeError("模型没有返回 SQL")
@@ -1053,6 +1062,7 @@ def run_experiment(run_id: str) -> None:
     executor = ThreadPoolExecutor(max_workers=MAX_GENERATION_CONCURRENCY, thread_name_prefix="nl2sql-run")
     futures: dict[Any, tuple[sqlite3.Row, sqlite3.Row]] = {}
     fatal_error = ""
+    consecutive_model_failures = 0
     try:
         with state_connection() as connection:
             connection.execute(
@@ -1105,14 +1115,25 @@ def run_experiment(run_id: str) -> None:
 
             if futures:
                 completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                completed_results: list[dict[str, Any]] = []
                 for future in completed:
                     run_snapshot, item = futures.pop(future)
                     result = future.result()
                     persistence_error = persist_experiment_item_result(run_id, run_snapshot, item, result)
-                    if result["fatal"] and not fatal_error:
-                        fatal_error = result["generation_error"]
-                    elif persistence_error and not fatal_error:
+                    completed_results.append({"result": result, "persistence_error": persistence_error})
+                    if persistence_error and not fatal_error:
                         fatal_error = persistence_error
+                if not fatal_error and completed_results:
+                    failed_results = [entry["result"] for entry in completed_results if entry["result"]["fatal"]]
+                    if failed_results and len(failed_results) == len(completed_results):
+                        consecutive_model_failures += len(failed_results)
+                        if consecutive_model_failures >= MAX_CONSECUTIVE_MODEL_FAILURES:
+                            fatal_error = (
+                                f"模型服务连续 {consecutive_model_failures} 个样本运行失败；"
+                                f"最后错误：{failed_results[-1]['generation_error']}"
+                            )
+                    else:
+                        consecutive_model_failures = 0
     except Exception as error:
         executor.shutdown(wait=True)
         message = f"批次运行异常：{str(error)[:800]}"
@@ -1161,7 +1182,7 @@ def get_experiment_config() -> dict[str, Any]:
         safe_netloc += f":{port}"
     safe_base_url = urlunsplit((parsed_url.scheme, safe_netloc, parsed_url.path, "", ""))
     return {
-        "provider_ready": bool(API_KEY) and not configuration_error,
+        "provider_ready": not configuration_error,
         "configuration_error": configuration_error,
         "base_url": safe_base_url,
         "default_model": DEFAULT_MODEL,
@@ -1174,8 +1195,6 @@ def get_experiment_config() -> dict[str, Any]:
 @app.post("/api/experiments", status_code=202)
 def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) -> dict[str, Any]:
     recover_interrupted_experiments()
-    if not API_KEY:
-        raise HTTPException(status_code=503, detail="未配置 NL2SQL_API_KEY，请在 backend/.env 中配置后重启后端")
     try:
         parsed_url = urlsplit(API_BASE_URL)
         _ = parsed_url.port

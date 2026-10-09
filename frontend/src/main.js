@@ -546,7 +546,7 @@ function renderResultsView() {
         <label class="model-field sample-limit-field"><span>样本数</span><input id="experiment-sample-limit" type="number" min="0" max="${state.experimentConfig?.max_samples || 10000}" value="20" /><small>0 表示整个划分</small></label>
       <button class="primary-button experiment-start-button" data-action="start-experiment" ${experimentStartPending || experimentHistoryLoading || !experimentHistoryLoaded || state.experiments.some((run) => ['queued', 'running'].includes(run.status)) || !state.experimentConfig?.provider_ready || !state.experimentConfig?.default_model ? 'disabled' : ''}>${experimentStartPending ? '<span class="spinner small"></span>正在创建批次' : `${icon('arrow', 16)}开始批量运行`}</button>
       </div>
-      <div id="experiment-provider-note" class="experiment-provider-note ${state.experimentConfig?.provider_ready ? 'ready' : ''}">${state.experimentConfig?.provider_ready ? `模型服务配置已填写 · ${esc(state.experimentConfig.base_url)} · 实际可用性以批次结果为准` : state.experimentConfig?.configuration_error ? `模型服务配置错误：${esc(state.experimentConfig.configuration_error)}` : '模型服务未配置。请在 backend/.env 中设置 NL2SQL_API_KEY；可用 NL2SQL_API_BASE_URL 指定 OpenAI 兼容服务地址。'}</div>
+      <div id="experiment-provider-note" class="experiment-provider-note ${state.experimentConfig?.provider_ready ? 'ready' : ''}">${state.experimentConfig?.provider_ready ? `模型服务地址已配置 · ${esc(state.experimentConfig.base_url)} · 实际可用性以批次结果为准` : state.experimentConfig?.configuration_error ? `模型服务配置错误：${esc(state.experimentConfig.configuration_error)}` : '请在 backend/.env 中配置 NL2SQL_API_BASE_URL；服务启用鉴权时再填写 NL2SQL_API_KEY。'}</div>
       <div class="experiment-method-note">评测使用只读查询结果比对；测试集可单独运行。若根据测试集错误反复调整 Prompt，这组数据也会参与调参。</div>
       <details class="experiment-prompt-editor"><summary>本轮 System Prompt（可编辑，逐条保存实际 Prompt）</summary><textarea id="experiment-system-prompt" spellcheck="false">${esc(state.experimentConfig?.default_system_prompt || '')}</textarea></details>
     </div>
@@ -743,7 +743,7 @@ async function loadExperiments() {
     const note = document.querySelector('#experiment-provider-note')
     if (note) {
       note.classList.toggle('ready', config.provider_ready)
-      note.innerHTML = config.provider_ready ? `模型服务配置已填写 · ${esc(config.base_url)} · 实际可用性以批次结果为准` : config.configuration_error ? `模型服务配置错误：${esc(config.configuration_error)}` : '模型服务未配置。请在 backend/.env 中设置 NL2SQL_API_KEY；可用 NL2SQL_API_BASE_URL 指定 OpenAI 兼容服务地址。'
+      note.innerHTML = config.provider_ready ? `模型服务地址已配置 · ${esc(config.base_url)} · 实际可用性以批次结果为准` : config.configuration_error ? `模型服务配置错误：${esc(config.configuration_error)}` : '请在 backend/.env 中配置 NL2SQL_API_BASE_URL；服务启用鉴权时再填写 NL2SQL_API_KEY。'
     }
     const response = await request('/experiments?limit=30')
     if (sequence !== requestSequence.experiments || state.view !== 'results') return
@@ -903,7 +903,7 @@ async function startExperiment() {
   }
   try {
     const config = await loadExperimentConfig()
-    if (!config.provider_ready) throw new Error('先在 backend/.env 配置 NL2SQL_API_KEY 并重启后端，才能调用模型。')
+    if (!config.provider_ready) throw new Error('模型服务地址未配置或格式无效，请检查 backend/.env 中的 NL2SQL_API_BASE_URL。')
     const model = document.querySelector('#experiment-model')?.value.trim() || ''
     if (!model) throw new Error('请填写模型 ID。')
     const systemPrompt = document.querySelector('#experiment-system-prompt')?.value || ''

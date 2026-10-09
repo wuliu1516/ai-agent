@@ -82,17 +82,21 @@ Makefile 的配方中不要直接写中文：Windows 版 make 会按系统码页
 
 ## 批量运行与评测配置
 
-批量实验通过后端配置的 OpenAI-compatible 服务生成 SQL。后端启动时优先读取 `backend/.env`，再读取项目根目录 `.env` 作为回退配置，向 `{NL2SQL_API_BASE_URL}/chat/completions` 发送请求；系统环境变量优先级最高，API Key 只保留在后端，不会传到浏览器。首次配置可复制 `backend/.env.example` 到 `backend/.env`，再填写服务地址、密钥和模型：
+批量实验通过后端配置的 OpenAI-compatible 服务生成 SQL。后端启动时优先读取 `backend/.env`，再读取项目根目录 `.env` 作为回退配置，向 `{NL2SQL_API_BASE_URL}/chat/completions` 发送请求；系统环境变量优先级最高，API Key 只保留在后端，不会传到浏览器。未启用鉴权的 vLLM 服务可以将 API Key 留空；启用鉴权的服务需要填写 Key。首次配置可复制 `backend/.env.example` 到 `backend/.env`，再填写服务地址和模型：
 
 ```dotenv
 NL2SQL_API_BASE_URL=https://api.example.com/v1
-NL2SQL_API_KEY=your_api_key
+NL2SQL_API_KEY=
 NL2SQL_MODEL=your_model_id
+# For Qwen3 on vLLM, set true to disable thinking output.
+NL2SQL_DISABLE_THINKING=true
 ```
 
 也可以通过系统环境变量覆盖 `.env` 中的值。配置后重启后端。
 
 `NL2SQL_API_BASE_URL` 是 API 前缀，后端会在末尾追加 `/chat/completions`。批量运行页面允许填写本轮使用的模型和 system prompt；模型默认值来自 `NL2SQL_MODEL`。每条样本的结果可查看本次实际使用的 Prompt、自然语言问题、金标 SQL、生成 SQL 和初步原因，供逐条审阅。
+
+`NL2SQL_DISABLE_THINKING=true` 会在请求中发送 `chat_template_kwargs.enable_thinking=false`，适用于支持该参数的 Qwen3/vLLM 服务。后端也会移除响应中 `</think>` 之前的推理文本，确保评测器只收到最终 SQL。
 
 批量运行默认最多处理所选数据划分中的 20 条样本；将数量设为 `0` 表示运行该划分的全部样本。每批最多并发生成 6 条样本，进度分别统计排队中、生成中和已处理样本。创建批次后任务在后端后台运行，可通过以下接口查看运行状态和结果：
 
