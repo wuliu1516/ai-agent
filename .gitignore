@@ -8,3 +8,5 @@ backend/storage/*.sqlite3
 .venv
 data/
 build/
+*.pid
+*.log
