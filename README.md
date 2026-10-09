@@ -4,17 +4,17 @@
 
 ## 启动
 
-Windows 环境由 CMake/Ninja 统一封装。首次使用需要安装 **CMake 4.4+**、**Ninja**、**Python 3.12.4**、**Node.js 24.x** 和 **npm 11.x**；项目数据默认从 `D:\dataset\CSpider` 读取。该目录应包含 `train.json`、`train_gold.sql`、`dev.json`、`dev_gold.sql`、`tables.json`、`char_emb.txt`、`README.txt` 和 `database`。
+启动命令统一放在根目录的 `Makefile`。首次使用需要安装 **GNU Make**、**Git for Windows**（提供 `sh.exe`）、**Python 3.12.4**、**Node.js 24.x** 和 **npm 11.x**；项目数据默认从 `D:\dataset\CSpider` 读取。该目录应包含 `train.json`、`train_gold.sql`、`dev.json`、`dev_gold.sql`、`tables.json`、`char_emb.txt`、`README.txt` 和 `database`。
 
 ```powershell
-# 在仓库根目录执行。配置任务运行器；生成器固定为 Ninja。
-cmake -S . -B build -G Ninja
+# 安装 GNU Make（一次性；装完后需重开终端）。
+winget install ezwinports.make
 
-# 创建 .venv、安装锁定的 Python/Node 依赖，并生成 data/CSpider 划分。
-cmake --build build --target setup
+# 在仓库根目录执行。创建 .venv、安装锁定的 Python/Node 依赖，并生成 data/CSpider 划分。
+make setup
 
 # 后台启动 FastAPI 和 Vite，并等待健康检查通过。
-cmake --build build --target start
+make start
 ```
 
 服务启动后：
@@ -25,15 +25,18 @@ cmake --build build --target start
 常用任务：
 
 ```powershell
-# 只安装 Python/前端依赖，不重新生成数据划分。
-cmake --build build --target setup-deps
-
-# 查看前后端状态；停止本工作台的 5173/8000 监听服务。
-cmake --build build --target status
-cmake --build build --target stop
+make                # 列出全部目标
+make setup-deps     # 只安装 Python/前端依赖，不重新生成数据划分
+make status         # 查看前后端状态
+make stop           # 停止本工作台的 5173/8000 监听服务
+make restart        # 重启
+make logs           # 跟踪前后端日志
+make run-backend    # 前台运行后端，便于调试（run-frontend 同理）
 ```
 
-`setup.ps1` 和 `run.ps1` 仍可使用，现已改为上述 CMake target 的兼容包装器（`setup.ps1 -SkipDataSplit` 对应 `setup-deps`）。CMake 会校验 Python 3.12.4、Node.js 24.x、npm 11.x；如数据目录不在默认位置，请在首次配置时指定 `-DCSPIDER_DATA_SOURCE_DIR=<路径>`。
+`setup.ps1` 和 `run.ps1` 仍可使用，现为上述 make 目标的包装器（`setup.ps1 -SkipDataSplit` 对应 `make setup-deps`）。Makefile 会校验 Python 3.12.4、Node.js 24.x、npm 11.x；路径和端口可在命令行覆盖，例如 `make setup CSPIDER_DATA_SOURCE_DIR=E:/data/CSpider PYTHON=C:/Python312/python.exe`。
+
+Makefile 的配方中不要直接写中文：Windows 版 make 会按系统码页转码配方，中文会变成乱码或引发 sh 语法错误。提示文字统一放在 `make/messages.sh`。
 ## 页面功能
 
 - 开发集、验证集、测试集样本列表与问题搜索。
