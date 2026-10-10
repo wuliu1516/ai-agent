@@ -14,6 +14,57 @@ SQL_TOKEN_PATTERN = re.compile(
     re.UNICODE,
 )
 
+# 结构签名线索：示例库里没有目标题的表名/字段名（跨库不重叠），所以只能按"题目需要什么形状的 SQL"
+# 去匹配示例，而不是按题目和示例的用词相似度。
+SHAPE_CUES: dict[str, tuple[str, ...]] = {
+    "agg": (
+        "平均", "总计", "总和", "总共", "总数", "数量", "多少", "几个", "几位", "每个", "每种", "每年",
+        "分别", "多少次", "次数", "几门", "几部", "几首", "总", "共",
+        "average", "total", "sum", "count", "how many", "number of", "each", "per ",
+    ),
+    "order": (
+        "最高", "最低", "最大", "最小", "最多", "最少", "排名", "前几", "第几", "第一个", "最后一个",
+        "top", "highest", "lowest", "largest", "smallest", "most", "least", "rank", "first", "last",
+    ),
+    "neg": (
+        "除了", "不包括", "不包含", "没有任何", "至少一个", "没有", "不是", "未",
+        "without", "except", "not ", "no ", "none",
+    ),
+}
+
+JOIN_PATTERN = re.compile(r"\bjoin\b|\bfrom\s+\w+\s*,", re.IGNORECASE)
+AGG_PATTERN = re.compile(r"\b(count|sum|avg|min|max|total)\s*\(", re.IGNORECASE)
+NEG_PATTERN = re.compile(r"\b(not\s+in|not\s+exists|except|!=|<>)\b", re.IGNORECASE)
+
+
+def sql_shape(sql: str) -> frozenset[str]:
+    """粗粒度结构签名：聚合、连接、排序、限制、否定。用于按结构而非用词匹配示例。"""
+    padded = f" {sql.casefold()} "
+    features: set[str] = set()
+    if AGG_PATTERN.search(sql) or " group by " in padded:
+        features.add("agg")
+    if JOIN_PATTERN.search(sql):
+        features.add("join")
+    if " order by " in padded:
+        features.add("order")
+    if " limit " in padded or " having " in padded:
+        features.add("limit")
+    if NEG_PATTERN.search(sql):
+        features.add("neg")
+    return frozenset(features)
+
+
+def question_shape(question: str) -> frozenset[str]:
+    """从问题线索保守推断需要的结构；没有明确线索就不加约束。"""
+    normalized = question.casefold()
+    features: set[str] = set()
+    for feature in ("agg", "order", "neg"):
+        if any(cue in normalized for cue in SHAPE_CUES[feature]):
+            features.add(feature)
+    return frozenset(features)
+
+
+
 
 def normalized_identifier(value: str) -> str:
     return " ".join(value.casefold().split())
@@ -262,11 +313,18 @@ class FewShotRetriever:
             self.validity_cache[sample_id] = usable
         return usable
 
-    def retrieve(self, db_id: str, question: str, count: int) -> list[dict[str, Any]]:
+    def retrieve(self, db_id: str, question: str, count: int, index_by_identifiers: bool = False) -> list[dict[str, Any]]:
+        """Retrieve demonstrations.
+
+        ``index_by_identifiers=False`` (默认) 按"题目需要的 SQL 结构"匹配示例，并强制两条示例结构互补：
+        开发集与验证集的库完全不重叠，示例的表名/字段名对目标题没有可迁移性；实测中默认检索会把
+        64% 的两个名额给同一个源库、且偏向复杂模板，因此按结构重排。
+        ``index_by_identifiers=True`` 保留旧行为（schema 标识符加权 + 纯词面相似度），用于 A/B 对照。
+        """
         if count <= 0 or not self.documents:
             return []
         normalized_question = re.sub(r"[\W_]+", "", question.casefold())
-        cache_key = (db_id, normalized_question, count)
+        cache_key = (db_id, normalized_question, count, index_by_identifiers)
         with self.retrieval_lock:
             cached_indices = self.retrieval_cache.get(cache_key)
         if cached_indices is not None:
@@ -274,8 +332,9 @@ class FewShotRetriever:
 
         query_terms = self._text_tokens(question)
         query_terms = Counter({f"q:{term}": frequency for term, frequency in query_terms.items()})
-        for term, frequency in self._schema_tokens(db_id).items():
-            query_terms[f"s:{term[2:]}"] += frequency
+        if index_by_identifiers:
+            for term, frequency in self._schema_tokens(db_id).items():
+                query_terms[f"s:{term[2:]}"] += frequency
 
         document_count = len(self.documents)
         scores: defaultdict[int, float] = defaultdict(float)
@@ -304,28 +363,62 @@ class FewShotRetriever:
                     * min(query_frequency, 2)
                 )
 
-        candidates = sorted(scores, key=lambda index: scores[index], reverse=True)[:self.candidate_limit]
+        wanted = question_shape(question)
+        shape_scores = {index: sql_shape(str(self.documents[index].get("_gold_sql", ""))) for index in scores}
+        ranked = sorted(
+            scores,
+            key=lambda index: (
+                -len(wanted & shape_scores[index]) if not index_by_identifiers else 0,
+                -scores[index],
+            ),
+        )
+
         selected: list[dict[str, Any]] = []
         selected_indices: list[int] = []
         seen_sql: set[str] = set()
+        used_shapes: set[frozenset[str]] = set()
+        used_databases: set[str] = set()
         validated_candidates = 0
-        for document_index in candidates:
+
+        def accept(document_index: int, *, require_novel: bool) -> bool:
+            nonlocal validated_candidates
             record = self.documents[document_index]
             if re.sub(r"[\W_]+", "", str(record.get("question", "")).casefold()) == normalized_question:
-                continue
+                return False
             canonical_sql = re.sub(r"\s+", " ", str(record.get("_gold_sql", "")).strip()).rstrip(";").casefold()
             if not canonical_sql or canonical_sql in seen_sql:
-                continue
+                return False
+            shape = shape_scores[document_index]
+            database = str(record["db_id"])
+            # 优先选结构不同、来源库不同的示例，让有限的名额覆盖更多写法。
+            if require_novel and not index_by_identifiers:
+                if shape in used_shapes or database in used_databases:
+                    return False
             if validated_candidates >= self.validation_candidate_limit:
-                break
+                return False
             validated_candidates += 1
             if not self._example_is_usable(record):
-                continue
+                return False
             seen_sql.add(canonical_sql)
+            used_shapes.add(shape)
+            used_databases.add(database)
             selected.append(record)
             selected_indices.append(document_index)
+            return True
+
+        # 先按"结构互补、来源库不同"挑选，名额未满再用其余候补。
+        for require_novel in (True, False):
+            for document_index in ranked[: self.candidate_limit]:
+                if len(selected) >= count:
+                    break
+                if document_index in selected_indices:
+                    continue
+                accept(document_index, require_novel=require_novel)
             if len(selected) >= count:
                 break
+        with self.retrieval_lock:
+            self.retrieval_cache[cache_key] = tuple(selected_indices)
+        return selected
         with self.retrieval_lock:
             self.retrieval_cache[cache_key] = tuple(selected_indices)
         return selected

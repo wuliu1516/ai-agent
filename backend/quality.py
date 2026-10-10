@@ -149,7 +149,11 @@ def validation_checks(execution: dict[str, Any]) -> dict[str, Any]:
 
 
 def validation_assessment(execution: dict[str, Any], execution_summary: dict[str, Any]) -> dict[str, Any]:
-    """Deterministic (no-LLM) assessment used when SQL validation is on but rubric scoring is off."""
+    """Deterministic (no-LLM) assessment used when SQL validation is on but rubric scoring is off.
+
+    只有执行报错才判为需要重写。返回 0 行或全 NULL 只是提示（见 validation_checks.result_sanity）：
+    实测中按空结果重写会把本来正确的结果换成错的（脏问题里合法的空结果不少）。
+    """
     checks = validation_checks(execution)
     validation = {"checks": checks, "execution": execution_summary}
     if deterministic_hard_failure(execution):
@@ -159,17 +163,6 @@ def validation_assessment(execution: dict[str, Any], execution_summary: dict[str
             "dimensions": {},
             "issues": [error[:400]],
             "feedback": f"上一版 SQL 执行报错，请据此修复：{error[:800]}",
-            "score_source": "validation",
-            "validation": validation,
-            "needs_repair": True,
-        }
-    issues = result_sanity_issues(execution)
-    if issues:
-        return {
-            "score": 60,
-            "dimensions": {},
-            "issues": issues,
-            "feedback": issues[0],
             "score_source": "validation",
             "validation": validation,
             "needs_repair": True,

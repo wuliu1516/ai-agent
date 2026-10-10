@@ -67,8 +67,11 @@ MAX_EVAL_ROWS = 5_000
 MAX_EVAL_SECONDS = 8
 RESULT_PREVIEW_ROWS = 12
 FEWSHOT_EXAMPLE_COUNT = 2
-FEWSHOT_RETRIEVAL_VERSION = "bm25-char-ngrams-v3-question-sql-only"
-QUERY_PLANNING_VERSION = "complex-query-plan-v2-structured"
+FEWSHOT_RETRIEVAL_VERSION = "bm25-char-ngrams-v4-structural"
+FEWSHOT_LEGACY_VERSION = "bm25-char-ngrams-v3-question-sql-only"
+QUERY_PLANNING_VERSION = "complex-query-plan-v3-structured"
+# 候选选择余量：修订版分数要高出这么多才替换初版，避免评分噪声把正确结果换掉。
+SELECTION_MARGIN = 10
 GENERATION_PARAMS = {"temperature": 0, "max_tokens": 2048}
 QUERY_PLAN_SYSTEM_PROMPT = """你是一个 Text-to-SQL 查询规划器。根据用户问题和目标 Schema，整理生成 SQL 所需的结构化计划。
 只输出一个 JSON 对象，字段必须包含 target_fields、filters、tables_and_joins、aggregation_grouping、sorting_limit。每个字段用简短字符串或字符串数组表达；没有相关内容时用空字符串或空数组。不要输出 SQL、Markdown 或解释。严格依据问题和 Schema；不确定时明确写出不确定，不要臆造表、字段、值或关联关系。"""
@@ -406,6 +409,8 @@ class ExperimentInput(BaseModel):
     sample_limit: int = Field(default=20, ge=0, le=MAX_EXPERIMENT_SAMPLES)
     sample_seed: int = Field(default=42, ge=0, le=2_147_483_647)
     use_few_shot: bool = True
+    few_shot_mode: str = Field(default="structural", pattern="^(structural|legacy)$")
+    few_shot_examples: int = Field(default=2, ge=1, le=6)
     use_target_schema: bool = True
     use_query_planning: bool = False
     use_sql_validation: bool = False
@@ -463,8 +468,15 @@ def build_prompt(
     question: str,
     few_shot_count: int = 0,
     include_target_schema: bool = True,
+    few_shot_mode: str = "structural",
 ) -> tuple[str, str]:
-    demonstrations = FEWSHOT_RETRIEVER.retrieve(db_id, question, few_shot_count) if few_shot_count else []
+    demonstrations = (
+        FEWSHOT_RETRIEVER.retrieve(
+            db_id, question, few_shot_count, index_by_identifiers=few_shot_mode == "legacy"
+        )
+        if few_shot_count
+        else []
+    )
     prompt_sections: list[str] = []
     if demonstrations:
         examples = [
@@ -496,8 +508,8 @@ COMPLEX_QUERY_CUES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("多条件组合", ("并且", "同时", "以及", "或者", "both ", "either ", " and ", " or ")),
     ("嵌套或排除", ("除了", "不包括", "不包含", "没有任何", "没有", "至少一个", "all of", "none of", "without", "except", "not any")),
 )
-# 单一弱信号（如只有“数量”）不触发规划，避免简单题被多余的计划误导。
-STRONG_COMPLEX_REASONS = {"嵌套或排除"}
+# 聚合/分组、比较/排名、嵌套/排除任一命中就值得规划；只有"多条件组合"这类弱信号需要两条线索同时命中。
+STRONG_COMPLEX_REASONS = {"聚合或分组", "比较或排名", "嵌套或排除"}
 MIN_COMPLEX_REASONS = 2
 
 
@@ -1346,7 +1358,7 @@ def _sql_review_finalize(state: SQLReviewGraphState) -> dict[str, Any]:
             }
         }
 
-    def candidate_key(candidate: dict[str, Any]) -> tuple[int, int]:
+    def candidate_rank(candidate: dict[str, Any]) -> tuple[int, int]:
         execution_result = candidate["execution"]
         if execution_result.get("ok"):
             validity_rank = 2
@@ -1358,7 +1370,13 @@ def _sql_review_finalize(state: SQLReviewGraphState) -> dict[str, Any]:
         score_rank = int(raw_score) if isinstance(raw_score, (int, float)) else -1
         return validity_rank, score_rank
 
-    selected = max(candidates, key=candidate_key)
+    # 保守选择：只有明显更好时才采用修订版，避免评分噪声把原本正确的 SQL 换掉。
+    selected = candidates[0]
+    for candidate in candidates[1:]:
+        best_rank, best_score = candidate_rank(selected)
+        rank, score = candidate_rank(candidate)
+        if rank > best_rank or (rank == best_rank and score >= best_score + SELECTION_MARGIN):
+            selected = candidate
     quality_assessment: dict[str, Any] = {}
     retry_generation_errors = state.get("retry_generation_errors", [])
     if state["quality_enabled"]:
@@ -1808,7 +1826,10 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
         raise HTTPException(status_code=422, detail="System Prompt 不能为空")
     total_samples = len(RECORDS[body.split])
     few_shot_enabled = body.use_few_shot and body.split != "development"
-    few_shot_count = FEWSHOT_EXAMPLE_COUNT if few_shot_enabled else 0
+    few_shot_count = body.few_shot_examples if few_shot_enabled else 0
+    few_shot_retrieval_version = (
+        FEWSHOT_LEGACY_VERSION if body.few_shot_mode == "legacy" else FEWSHOT_RETRIEVAL_VERSION
+    ) if few_shot_enabled else ""
     target_schema_enabled = body.use_target_schema
     if body.sample_limit == 0 or body.sample_limit >= total_samples:
         sample_indices = list(range(total_samples))
@@ -1822,7 +1843,8 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
             "few_shot_enabled": few_shot_enabled,
             "few_shot_count": few_shot_count,
             "few_shot_source_split": "development" if few_shot_enabled else "",
-            "few_shot_retrieval_version": FEWSHOT_RETRIEVAL_VERSION,
+            "few_shot_retrieval_version": few_shot_retrieval_version,
+            "few_shot_mode": body.few_shot_mode if few_shot_enabled else "",
             "target_schema_enabled": target_schema_enabled,
             "query_planning": body.use_query_planning,
             "query_planning_version": QUERY_PLANNING_VERSION if body.use_query_planning else "",
@@ -1849,7 +1871,8 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
         "few_shot_enabled": few_shot_enabled,
         "few_shot_count": few_shot_count,
         "few_shot_source_split": "development" if few_shot_enabled else "",
-        "few_shot_retrieval_version": FEWSHOT_RETRIEVAL_VERSION,
+        "few_shot_retrieval_version": few_shot_retrieval_version,
+        "few_shot_mode": body.few_shot_mode if few_shot_enabled else "",
         "target_schema_enabled": target_schema_enabled,
         "query_planning": body.use_query_planning,
         "query_planning_version": QUERY_PLANNING_VERSION if body.use_query_planning else "",
@@ -1867,12 +1890,17 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
                 "detail": "提示词要求只返回回答问题所需的字段，减少额外投影列。",
             },
             {
-                "id": FEWSHOT_RETRIEVAL_VERSION,
+                "id": few_shot_retrieval_version or FEWSHOT_RETRIEVAL_VERSION,
                 "title": "相似示例检索（Few-shot）",
                 "applied": few_shot_enabled,
                 "detail": (
-                    f"按中文字符片段和 schema 标识符，从 development 集检索最多 {FEWSHOT_EXAMPLE_COUNT} 个示例；"
-                    "每条示例只包含问题与 SQL，不附示例 Schema；候选 SQL 需只读执行成功且返回非空、非全 NULL 结果。"
+                    (
+                        f"按题目所需 SQL 结构（聚合/连接/排序/否定线索）从 development 集检索 {few_shot_count} 个示例，"
+                        "并强制两条示例结构互补、尽量来自不同源库；"
+                        if body.few_shot_mode != "legacy"
+                        else f"按中文字符片段和 schema 标识符，从 development 集检索 {few_shot_count} 个示例（旧版检索，用于对照）；"
+                    )
+                    + "每条示例只包含问题与 SQL，不附示例 Schema；候选 SQL 需只读执行成功且返回非空、非全 NULL 结果。"
                     if few_shot_enabled
                     else "本轮未启用：用户关闭该选项。"
                     if not body.use_few_shot
