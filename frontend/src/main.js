@@ -168,6 +168,7 @@ function updateShell() {
   const activeView = state.view
   const viewNames = { samples: '样本与金标', databases: '数据库浏览', results: '批量运行审阅' }
   document.querySelector('#breadcrumb-current').textContent = viewNames[activeView]
+  document.querySelector('#overview-stats').hidden = activeView === 'results'
   document.querySelectorAll('.nav-item[data-view]').forEach((button) => {
     button.classList.toggle('active', button.dataset.view === activeView)
   })
@@ -543,26 +544,33 @@ function renderResultsView() {
       <div class="heading-summary"><strong id="experiment-run-count-summary">${fmt(state.experiments.length)}</strong><span>个运行批次</span></div>
     </div>
     <section class="experiment-create panel">
-      <div class="experiment-create-heading"><div><strong>启动批量运行</strong><small id="experiment-run-description">每条样本可选择是否提供目标题 Schema；最多 ${fmt(state.experimentConfig?.max_concurrency ?? 6)} 路并发生成；金标只用于运行后的评测。</small></div><span class="experiment-seed">固定抽样种子 42</span></div>
+      <div class="experiment-create-heading"><div><strong>新建批量运行</strong><small id="experiment-run-description">选择数据集、模型和样本范围即可开始；每轮使用固定抽样种子 42，金标只用于运行后的评测。</small></div><span class="experiment-seed">最多 ${fmt(state.experimentConfig?.max_concurrency ?? 6)} 路并发</span></div>
       <div class="experiment-create-fields">
         <label class="select-field"><span>数据集</span><select id="experiment-split">${Object.entries(splitLabels).map(([key, label]) => `<option value="${key}" ${key === 'development' ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
         <label class="model-field"><span>模型</span><input id="experiment-model" type="text" value="${esc(state.experimentConfig?.default_model || '')}" placeholder="填写已配置服务中的模型 ID" maxlength="250" /></label>
         <label class="model-field sample-limit-field"><span>样本数</span><input id="experiment-sample-limit" type="number" min="0" max="${state.experimentConfig?.max_samples || 10000}" value="20" /><small>0 表示整个划分</small></label>
+        <button class="primary-button experiment-start-button" data-action="start-experiment" ${experimentStartPending || experimentHistoryLoading || !experimentHistoryLoaded || state.experiments.some((run) => ['queued', 'running'].includes(run.status)) || !state.experimentConfig?.provider_ready || !state.experimentConfig?.default_model ? 'disabled' : ''}>${experimentStartPending ? '<span class="spinner small"></span>正在创建批次' : `${icon('arrow', 16)}开始批量运行`}</button>
+      </div>
+      <div id="experiment-provider-note" class="experiment-provider-note ${state.experimentConfig?.provider_ready ? 'ready' : ''}">${state.experimentConfig?.provider_ready ? `模型服务地址已配置 · ${esc(state.experimentConfig.base_url)} · 实际可用性以批次结果为准` : state.experimentConfig?.configuration_error ? `模型服务配置错误：${esc(state.experimentConfig.configuration_error)}` : '请在 backend/.env 中配置 NL2SQL_API_BASE_URL；服务启用鉴权时再填写 NL2SQL_API_KEY。'}</div>
+      <details class="experiment-options">
+        <summary><strong>高级运行选项</strong><span>Few-shot、目标 Schema、查询计划、LangGraph、SQL 校验与质量评分</span></summary>
+        <div class="experiment-option-grid">
         <label class="few-shot-option"><input id="experiment-few-shot" type="checkbox" checked /><span><strong>相似示例（Few-shot）</strong><small>最多附 2 个 development 示例（只含问题 + SQL）；运行 development 时自动关闭</small></span></label>
         <label class="few-shot-option"><input id="experiment-target-schema" type="checkbox" checked /><span><strong>提供目标题 Schema</strong><small>关闭后生成模型看不到目标表名、字段和外键；Few-shot 示例只有问题 + SQL</small></span></label>
         <label class="few-shot-option"><input id="experiment-query-planning" type="checkbox" /><span><strong>复杂问题先生成查询计划</strong><small>聚合/分组、比较/排名、多条件或嵌套问题触发；计划节点多调用一次模型</small></span></label>
-      <button class="primary-button experiment-start-button" data-action="start-experiment" ${experimentStartPending || experimentHistoryLoading || !experimentHistoryLoaded || state.experiments.some((run) => ['queued', 'running'].includes(run.status)) || !state.experimentConfig?.provider_ready || !state.experimentConfig?.default_model ? 'disabled' : ''}>${experimentStartPending ? '<span class="spinner small"></span>正在创建批次' : `${icon('arrow', 16)}开始批量运行`}</button>
-      </div>
-      <div class="quality-scoring-controls">
-        <label class="few-shot-option quality-scoring-toggle"><input id="experiment-quality-scoring" type="checkbox" checked /><span><strong>语义评分与低分修订</strong><small>评分器只看问题、schema、SQL 和执行证据，不看金标；低于阈值时带反馈重试</small></span></label>
+        <label class="few-shot-option"><input id="experiment-langgraph" type="checkbox" checked /><span><strong>LangGraph 质控流程</strong><small>关闭后用等价的顺序循环执行同样的节点，便于对比编排本身的影响</small></span></label>
+        <label class="few-shot-option"><input id="experiment-sql-validation" type="checkbox" /><span><strong>SQL 执行校验与自动修复</strong><small>不调用评分模型；报错、0 行或全 NULL 时带错误信息重试（共用下方“最多修订次数”）</small></span></label>
+        </div>
+        <div class="quality-scoring-controls">
+        <label class="few-shot-option quality-scoring-toggle"><input id="experiment-quality-scoring" type="checkbox" /><span><strong>语义评分（Rubric）与低分修订</strong><small>评分器只看问题、schema、SQL 和执行证据，不看金标；低于阈值时带反馈重试</small></span></label>
         <label class="quality-number-field"><span>重试阈值</span><input id="experiment-quality-threshold" type="number" min="0" max="100" value="70" /><small>分（0–100）</small></label>
         <label class="quality-number-field"><span>最多修订次数</span><input id="experiment-quality-retries" type="number" min="0" max="2" value="1" /><small>每题最多 2 次</small></label>
         <label class="quality-model-field"><span>评分模型</span><input id="experiment-quality-judge-model" type="text" value="" placeholder="留空时使用生成模型" maxlength="250" /><small>空值默认与生成模型相同</small></label>
-      </div>
-      <div id="experiment-provider-note" class="experiment-provider-note ${state.experimentConfig?.provider_ready ? 'ready' : ''}">${state.experimentConfig?.provider_ready ? `模型服务地址已配置 · ${esc(state.experimentConfig.base_url)} · 实际可用性以批次结果为准` : state.experimentConfig?.configuration_error ? `模型服务配置错误：${esc(state.experimentConfig.configuration_error)}` : '请在 backend/.env 中配置 NL2SQL_API_BASE_URL；服务启用鉴权时再填写 NL2SQL_API_KEY。'}</div>
+        </div>
       <label class="experiment-optimization-note"><span>本轮优化备注</span><textarea id="experiment-optimization-note" maxlength="2000" placeholder="例如：本轮新增 Few-shot；从 development 检索最多 2 个可执行示例。"></textarea><small>备注与自动记录的 Prompt、Few-shot、SQL 输出清理设置会随批次保存。</small></label>
       <div class="experiment-method-note">Few-shot 示例只从 development 集检索，并跳过无法执行或无有效结果的 SQL；测试集可单独运行。若根据测试集错误反复调整 Prompt，这组数据也会参与调参。</div>
       <details class="experiment-prompt-editor"><summary>本轮 System Prompt（可编辑，逐条保存实际 Prompt）</summary><textarea id="experiment-system-prompt" spellcheck="false">${esc(state.experimentConfig?.default_system_prompt || '')}</textarea></details>
+      </details>
     </section>
     <section class="experiment-history panel"><div class="panel-heading"><div><strong>运行批次</strong><span id="experiment-runs-count" class="subtle-count"></span></div><span class="list-sort">最近运行在前</span></div><div id="experiment-run-list" class="experiment-run-list"><div class="list-loading"><span class="spinner small"></span>读取批次中</div></div></section>
     <section id="experiment-review" class="experiment-review"></section>
@@ -765,16 +773,16 @@ function renderResultPreview(title, summary) {
 
 function renderQualityAssessment(assessment) {
   if (!assessment?.enabled) return ''
-  const statusLabels = { pass: '通过', fail: '失败', unknown: '未判定', partial: '未完整执行' }
+  const statusLabels = { pass: '通过', fail: '失败', unknown: '未判定', partial: '未完整执行', warn: '可疑' }
   const attempts = Array.isArray(assessment.attempts) ? assessment.attempts : []
   const attemptCards = attempts.map((attempt) => {
     const validation = attempt.validation?.checks || {}
     const checks = Object.entries(validation).map(([key, check]) => {
-      const labels = { read_only: '只读', syntax: '语法', schema: 'Schema', execution: '执行' }
+      const labels = { read_only: '只读', syntax: '语法', schema: 'Schema', execution: '执行', result_sanity: '结果' }
       return `<span class="quality-check quality-check-${esc(check.status)}"><strong>${esc(labels[key] || key)}：${esc(statusLabels[check.status] || check.status)}</strong><small>${esc(check.evidence || '')}</small></span>`
     }).join('')
     const issues = (attempt.issues || []).map((issue) => `<li>${esc(issue)}</li>`).join('')
-    const source = attempt.score_source === 'deterministic' ? '确定性校验分' : attempt.score_source === 'llm_rubric' ? 'Rubric 评分' : '评分不可用'
+    const source = attempt.score_source === 'validation' ? '执行校验' : attempt.score_source === 'deterministic' ? '确定性校验分' : attempt.score_source === 'llm_rubric' ? 'Rubric 评分' : '评分不可用'
     const benchmark = attempt.benchmark_status ? evaluationStatusLabels[attempt.benchmark_status] || attempt.benchmark_status : '评测中'
     const dimensions = Object.entries(attempt.dimensions || {}).map(([key, value]) => `<span>${esc(key.replaceAll('_', ' '))} <b>${esc(value)}</b></span>`).join('')
     return `<article class="quality-attempt"><div class="quality-attempt-heading"><strong>第 ${fmt(attempt.attempt)} 次 · ${attempt.score == null ? '评分失败' : `${fmt(attempt.score)} / 100`}</strong><span>${esc(source)} · ${esc(benchmark)}${assessment.selected_attempt === attempt.attempt ? ' · 采用' : ''}</span></div><div class="quality-checks">${checks}</div>${dimensions ? `<div class="quality-dimensions">${dimensions}</div>` : ''}${attempt.grader_error ? `<p class="quality-grader-error">${esc(attempt.grader_error)}</p>` : ''}${issues ? `<ul class="quality-issues">${issues}</ul>` : ''}${attempt.feedback ? `<p class="quality-feedback">${esc(attempt.feedback)}</p>` : ''}<pre class="review-sql generated">${esc(attempt.sql || '')}</pre></article>`
@@ -1046,6 +1054,8 @@ async function startExperiment() {
         use_few_shot: document.querySelector('#experiment-few-shot')?.checked ?? true,
         use_target_schema: document.querySelector('#experiment-target-schema')?.checked ?? true,
         use_query_planning: document.querySelector('#experiment-query-planning')?.checked ?? false,
+        use_sql_validation: document.querySelector('#experiment-sql-validation')?.checked ?? false,
+        use_langgraph: document.querySelector('#experiment-langgraph')?.checked ?? true,
         use_quality_scoring: document.querySelector('#experiment-quality-scoring')?.checked ?? false,
         quality_score_threshold: Number(document.querySelector('#experiment-quality-threshold')?.value || 70),
         quality_retry_limit: Number(document.querySelector('#experiment-quality-retries')?.value || 0),

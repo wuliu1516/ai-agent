@@ -9,6 +9,7 @@ httptools==0.8.0
 httpx2==2.13.1
 idna==3.20
 jiter==0.17.0
+langchain-openai==1.7.0
 langgraph==1.2.14
 openai==3.22.1
 psutil==7.2.2
@@ -41,7 +42,9 @@ orjson==3.13.0
 ormsgpack==1.12.2
 packaging==26.3
 requests-toolbelt==1.0.0
+regex==2026.9.29
 requests==2.34.2
+tiktoken==0.14.0
 tenacity==9.2.1
 urllib3==2.8.0
 uuid_utils==0.17.1

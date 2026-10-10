@@ -8,14 +8,11 @@ import re
 import sqlite3
 import threading
 import time
-import urllib.error
-import urllib.request
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, TypedDict
@@ -28,6 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from .fewshot import FewShotRetriever
+from .llm import FatalModelServiceError, ModelGateway
 from .quality import (
     QUALITY_RUBRIC_SYSTEM_PROMPT,
     QUALITY_RUBRIC_VERSION,
@@ -35,6 +33,7 @@ from .quality import (
     parse_quality_response,
     quality_discrimination_summary,
     score_quality_prompt,
+    validation_assessment,
     validation_checks,
 )
 
@@ -69,7 +68,7 @@ MAX_EVAL_SECONDS = 8
 RESULT_PREVIEW_ROWS = 12
 FEWSHOT_EXAMPLE_COUNT = 2
 FEWSHOT_RETRIEVAL_VERSION = "bm25-char-ngrams-v3-question-sql-only"
-QUERY_PLANNING_VERSION = "complex-query-plan-v1"
+QUERY_PLANNING_VERSION = "complex-query-plan-v2-structured"
 GENERATION_PARAMS = {"temperature": 0, "max_tokens": 2048}
 QUERY_PLAN_SYSTEM_PROMPT = """你是一个 Text-to-SQL 查询规划器。根据用户问题和目标 Schema，整理生成 SQL 所需的结构化计划。
 只输出一个 JSON 对象，字段必须包含 target_fields、filters、tables_and_joins、aggregation_grouping、sorting_limit。每个字段用简短字符串或字符串数组表达；没有相关内容时用空字符串或空数组。不要输出 SQL、Markdown 或解释。严格依据问题和 Schema；不确定时明确写出不确定，不要臆造表、字段、值或关联关系。"""
@@ -409,7 +408,9 @@ class ExperimentInput(BaseModel):
     use_few_shot: bool = True
     use_target_schema: bool = True
     use_query_planning: bool = False
+    use_sql_validation: bool = False
     use_quality_scoring: bool = False
+    use_langgraph: bool = True
     quality_score_threshold: int = Field(default=70, ge=0, le=100)
     quality_retry_limit: int = Field(default=1, ge=0, le=2)
     quality_judge_model: str = Field(default="", max_length=250)
@@ -490,11 +491,14 @@ def build_prompt(
 
 
 COMPLEX_QUERY_CUES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("聚合或分组", ("平均", "总计", "总和", "总共", "一共有", "总数", "数量", "多少", "几个", "几位", "每个", "每种", "每年", "分别", "average", "total", "sum", "count", "how many", "number of", "per ", "each ", "group by")),
-    ("比较或排名", ("最高", "最低", "最大", "最小", "最多", "最少", "排名", "前几", "第几", "大于", "小于", "超过", "至少", "至多", "之间", "highest", "lowest", "most", "least", "top ", "rank", "more than", "less than", "at least", "at most", "between")),
-    ("多条件组合", ("并且", "同时", "以及", "或者", "且", "和", "与", "both ", "either ", " and ", " or ")),
-    ("嵌套或排除", ("除了", "不包括", "不包含", "没有任何", "至少一个", "all of", "none of", "without", "except", "not any")),
+    ("聚合或分组", ("平均", "总计", "总和", "总共", "一共有", "总数", "每个", "每种", "每年", "分别", "average", "total", "sum", "how many", "number of", "per ", "each ", "group by")),
+    ("比较或排名", ("最高", "最低", "最大", "最小", "最多", "最少", "排名", "前几", "第几", "超过", "至少", "至多", "之间", "highest", "lowest", "most", "least", "top ", "rank", "more than", "less than", "at least", "at most", "between")),
+    ("多条件组合", ("并且", "同时", "以及", "或者", "both ", "either ", " and ", " or ")),
+    ("嵌套或排除", ("除了", "不包括", "不包含", "没有任何", "没有", "至少一个", "all of", "none of", "without", "except", "not any")),
 )
+# 单一弱信号（如只有“数量”）不触发规划，避免简单题被多余的计划误导。
+STRONG_COMPLEX_REASONS = {"嵌套或排除"}
+MIN_COMPLEX_REASONS = 2
 
 
 def complex_query_reasons(question: str) -> list[str]:
@@ -506,6 +510,21 @@ def complex_query_reasons(question: str) -> list[str]:
     ]
 
 
+def should_plan(reasons: list[str]) -> bool:
+    return len(reasons) >= MIN_COMPLEX_REASONS or bool(STRONG_COMPLEX_REASONS & set(reasons))
+
+
+class QueryPlan(BaseModel):
+    target_fields: list[str] = Field(default_factory=list, description="SELECT 中只应出现的、回答问题所需的列或表达式")
+    filters: list[str] = Field(default_factory=list, description="WHERE/HAVING 条件，字面值必须与问题原文一致")
+    tables_and_joins: list[str] = Field(default_factory=list, description="需要的表及 JOIN 条件（遵循外键）")
+    aggregation_grouping: list[str] = Field(default_factory=list, description="聚合函数、GROUP BY；无则留空")
+    sorting_limit: list[str] = Field(default_factory=list, description="ORDER BY 与 LIMIT；无则留空")
+
+
+QUERY_PLAN_KEYS = tuple(QueryPlan.model_fields)
+
+
 def build_query_plan_prompt(user_prompt: str) -> str:
     context = re.sub(
         r"\s*Return one SQLite SELECT query only\.?\s*$",
@@ -515,7 +534,8 @@ def build_query_plan_prompt(user_prompt: str) -> str:
     ).rstrip()
     return (
         f"{context}\n\n"
-        "请先整理查询计划，不要生成 SQL。按 JSON 字段写清：目标字段、过滤条件、需要使用的表及连接关系、聚合/分组、排序/数量限制。"
+        "请先整理查询计划，不要生成 SQL。字段含义：target_fields 只列回答问题必需的列；filters 中的字面值照抄问题原文；"
+        "tables_and_joins 只列必要的表并遵循外键；aggregation_grouping、sorting_limit 没有则留空数组。"
     )
 
 
@@ -527,22 +547,13 @@ def normalize_query_plan(raw_plan: str) -> dict[str, Any]:
             parsed = json.loads(match.group(0))
             if isinstance(parsed, dict) and isinstance(parsed.get("query_plan"), dict):
                 parsed = parsed["query_plan"]
-            if isinstance(parsed, dict):
+            if isinstance(parsed, dict) and any(key in parsed for key in QUERY_PLAN_KEYS):
                 fields: dict[str, Any] = {}
-                for key in (
-                    "target_fields",
-                    "filters",
-                    "tables_and_joins",
-                    "aggregation_grouping",
-                    "sorting_limit",
-                ):
-                    value = parsed.get(key, "")
-                    if isinstance(value, (str, list)):
-                        fields[key] = value
-                    elif value is None:
-                        fields[key] = ""
-                    else:
-                        fields[key] = str(value)
+                for key in QUERY_PLAN_KEYS:
+                    value = parsed.get(key, [])
+                    if value is None:
+                        value = []
+                    fields[key] = value if isinstance(value, (str, list)) else str(value)
                 return fields
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
@@ -558,24 +569,13 @@ def build_prompt_with_query_plan(user_prompt: str, query_plan: dict[str, Any]) -
     )
 
 
-class FatalModelServiceError(RuntimeError):
-    pass
-
-
-def retry_delay(error: urllib.error.HTTPError, attempt: int) -> float:
-    retry_after = error.headers.get("Retry-After", "") if error.headers else ""
-    if retry_after:
-        try:
-            return max(0.0, min(float(retry_after), 30.0))
-        except ValueError:
-            try:
-                retry_at = parsedate_to_datetime(retry_after)
-                if retry_at.tzinfo is None:
-                    retry_at = retry_at.replace(tzinfo=timezone.utc)
-                return max(0.0, min((retry_at - datetime.now(timezone.utc)).total_seconds(), 30.0))
-            except (TypeError, ValueError, OverflowError):
-                pass
-    return float(2 ** attempt)
+MODEL_GATEWAY = ModelGateway(
+    API_BASE_URL,
+    API_KEY,
+    disable_thinking=DISABLE_THINKING,
+    temperature=GENERATION_PARAMS["temperature"],
+    max_tokens=GENERATION_PARAMS["max_tokens"],
+)
 
 
 def call_chat_completion(
@@ -585,78 +585,7 @@ def call_chat_completion(
     *,
     max_tokens: int | None = None,
 ) -> str:
-    parsed_base_url = urlsplit(API_BASE_URL)
-    endpoint_path = parsed_base_url.path.rstrip("/")
-    if not endpoint_path.endswith("/chat/completions"):
-        endpoint_path += "/chat/completions"
-    endpoint = urlunsplit((parsed_base_url.scheme, parsed_base_url.netloc, endpoint_path, "", ""))
-    request_payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        **GENERATION_PARAMS,
-    }
-    if max_tokens is not None:
-        request_payload["max_tokens"] = max_tokens
-    if DISABLE_THINKING:
-        request_payload["chat_template_kwargs"] = {"enable_thinking": False}
-    request_body = json.dumps(request_payload).encode("utf-8")
-    headers = {"Content-Type": "application/json"}
-    if API_KEY:
-        headers["Authorization"] = f"Bearer {API_KEY}"
-    request = urllib.request.Request(
-        endpoint,
-        data=request_body,
-        headers=headers,
-        method="POST",
-    )
-    payload = None
-    for attempt in range(4):
-        try:
-            with urllib.request.urlopen(request, timeout=90) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            break
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")[:600]
-            message = f"模型服务返回 HTTP {error.code}: {detail}"
-            if error.code in {408, 425, 429} or error.code >= 500:
-                if attempt < 3:
-                    delay = retry_delay(error, attempt)
-                    error.close()
-                    time.sleep(delay)
-                    continue
-                raise FatalModelServiceError(f"重试 4 次后仍失败：{message}") from error
-            raise FatalModelServiceError(message) from error
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
-            if attempt < 3:
-                time.sleep((2 ** attempt) + random.uniform(0, 0.5))
-                continue
-            raise FatalModelServiceError(
-                f"重试 4 次后仍无法连接模型服务（{type(error).__name__}）：{error}"
-            ) from error
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise FatalModelServiceError("模型服务返回内容不是有效 JSON") from error
-    if payload is None:
-        raise FatalModelServiceError("模型服务未返回有效响应")
-    try:
-        content = payload["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as error:
-        raise FatalModelServiceError("模型服务响应缺少 choices[0].message.content") from error
-    if isinstance(content, list):
-        content = "\n".join(
-            str(part.get("text", "")) for part in content if isinstance(part, dict)
-        )
-    text = str(content or "").strip()
-    thinking_ends = list(re.finditer(r"</think\s*>", text, flags=re.IGNORECASE))
-    if thinking_ends:
-        text = text[thinking_ends[-1].end():].strip()
-    text = re.sub(r"</?think\b[^>]*>", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"^```(?:sql)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
-    if not text:
-        raise RuntimeError("模型没有返回 SQL")
-    return text
+    return MODEL_GATEWAY.complete(model, system_prompt, user_prompt, max_tokens=max_tokens)
 
 
 def readonly_authorizer(action: int, arg1: str | None, arg2: str | None, database: str | None, trigger: str | None) -> int:
@@ -1221,6 +1150,8 @@ class SQLReviewGraphState(TypedDict, total=False):
     question: str
     gold_sql: str
     quality_enabled: bool
+    validation_enabled: bool
+    scoring_enabled: bool
     query_planning_enabled: bool
     query_plan: dict[str, Any]
     retry_limit: int
@@ -1249,32 +1180,30 @@ def _sql_review_route_start(state: SQLReviewGraphState) -> str:
 
 def _sql_review_plan(state: SQLReviewGraphState) -> dict[str, Any]:
     started = time.monotonic()
+    planner_prompt = build_query_plan_prompt(state["user_prompt"])
+    snapshot = {"system": QUERY_PLAN_SYSTEM_PROMPT, "user": planner_prompt}
     try:
-        raw_plan = call_chat_completion(
+        plan = MODEL_GATEWAY.structured(
             state["model"],
+            QueryPlan,
             QUERY_PLAN_SYSTEM_PROMPT,
-            build_query_plan_prompt(state["user_prompt"]),
+            planner_prompt,
+            from_model=lambda parsed: parsed.model_dump(),
+            from_text=normalize_query_plan,
             max_tokens=700,
         )
-        plan = normalize_query_plan(raw_plan)
         elapsed_ms = round((time.monotonic() - started) * 1000, 2)
         query_plan = {
             **state.get("query_plan", {}),
             "status": "generated_unstructured" if "raw_plan" in plan else "generated",
             "plan": plan,
             "latency_ms": elapsed_ms,
-            "planner_prompt": {
-                "system": QUERY_PLAN_SYSTEM_PROMPT,
-                "user": build_query_plan_prompt(state["user_prompt"]),
-            },
+            "planner_prompt": snapshot,
         }
-        generation_prompt = build_prompt_with_query_plan(state["user_prompt"], plan)
-        return {
-            "query_plan": query_plan,
-            "generation_prompt": generation_prompt,
-            "current_prompt": generation_prompt,
-            "generation_time_ms": state.get("generation_time_ms", 0.0) + elapsed_ms,
-        }
+        # 非结构化的原始计划容易误导生成，直接回退到无计划提示词。
+        generation_prompt = (
+            state["user_prompt"] if "raw_plan" in plan else build_prompt_with_query_plan(state["user_prompt"], plan)
+        )
     except Exception as error:
         elapsed_ms = round((time.monotonic() - started) * 1000, 2)
         query_plan = {
@@ -1282,17 +1211,15 @@ def _sql_review_plan(state: SQLReviewGraphState) -> dict[str, Any]:
             "status": "failed_fallback",
             "error": f"{type(error).__name__}: {str(error)[:800]}",
             "latency_ms": elapsed_ms,
-            "planner_prompt": {
-                "system": QUERY_PLAN_SYSTEM_PROMPT,
-                "user": build_query_plan_prompt(state["user_prompt"]),
-            },
+            "planner_prompt": snapshot,
         }
-        return {
-            "query_plan": query_plan,
-            "generation_prompt": state["user_prompt"],
-            "current_prompt": state["user_prompt"],
-            "generation_time_ms": state.get("generation_time_ms", 0.0) + elapsed_ms,
-        }
+        generation_prompt = state["user_prompt"]
+    return {
+        "query_plan": query_plan,
+        "generation_prompt": generation_prompt,
+        "current_prompt": generation_prompt,
+        "generation_time_ms": state.get("generation_time_ms", 0.0) + elapsed_ms,
+    }
 
 
 def _sql_review_generate(state: SQLReviewGraphState) -> dict[str, Any]:
@@ -1331,7 +1258,7 @@ def _sql_review_score(state: SQLReviewGraphState) -> dict[str, Any]:
     assessment: dict[str, Any] = {}
     quality_attempts = list(state.get("quality_attempts", []))
     grader_time_ms = state.get("grader_time_ms", 0.0)
-    if state["quality_enabled"]:
+    if state["scoring_enabled"]:
         grader_started = time.monotonic()
         assessment, execution = score_generated_sql(
             state["judge_model"],
@@ -1341,11 +1268,12 @@ def _sql_review_score(state: SQLReviewGraphState) -> dict[str, Any]:
             execution=execution,
         )
         grader_time_ms += float(assessment.get("grader_latency_ms", 0) or 0)
+        assessment["grading_wall_time_ms"] = round((time.monotonic() - grader_started) * 1000, 2)
+    elif state["validation_enabled"]:
+        assessment = validation_assessment(execution, result_summary(execution))
+    if assessment:
         assessment["attempt"] = state["attempt_number"]
         assessment["sql"] = candidate_sql
-        assessment["grading_wall_time_ms"] = round(
-            (time.monotonic() - grader_started) * 1000, 2
-        )
         quality_attempts.append(assessment)
 
     candidate = {
@@ -1368,15 +1296,13 @@ def _sql_review_after_generate(state: SQLReviewGraphState) -> str:
 
 
 def _sql_review_after_score(state: SQLReviewGraphState) -> str:
-    if not state["quality_enabled"]:
+    if not state["quality_enabled"] or state["attempt_number"] >= state["attempt_limit"]:
         return "finalize"
     assessment = state.get("assessment", {})
+    if assessment.get("score_source") == "validation":
+        return "prepare_retry" if assessment.get("needs_repair") else "finalize"
     score = assessment.get("score")
-    if (
-        score is None
-        or score >= state["score_threshold"]
-        or state["attempt_number"] >= state["attempt_limit"]
-    ):
+    if score is None or score >= state["score_threshold"]:
         return "finalize"
     return "prepare_retry"
 
@@ -1537,6 +1463,28 @@ def get_sql_review_graph():
     return graph.compile()
 
 
+def run_sql_review_linear(state: SQLReviewGraphState) -> SQLReviewGraphState:
+    """Same nodes as the StateGraph, driven by a plain loop (use_langgraph=false)."""
+    state = dict(state)
+
+    def step(node: Any) -> None:
+        state.update(node(state))
+
+    if _sql_review_route_start(state) == "plan":
+        step(_sql_review_plan)
+    while True:
+        step(_sql_review_generate)
+        if _sql_review_after_generate(state) == "finalize":
+            break
+        step(_sql_review_validate)
+        step(_sql_review_score)
+        if _sql_review_after_score(state) == "finalize":
+            break
+        step(_sql_review_prepare_retry)
+    step(_sql_review_finalize)
+    return state  # type: ignore[return-value]
+
+
 def generate_and_evaluate_experiment_item(run: sqlite3.Row, item: sqlite3.Row) -> dict[str, Any]:
     total_started = time.monotonic()
     try:
@@ -1564,24 +1512,23 @@ def generate_and_evaluate_experiment_item(run: sqlite3.Row, item: sqlite3.Row) -
         }
 
     parameters = parse_json(run["parameters_json"], {})
-    quality_enabled = bool(parameters.get("quality_scoring"))
+    scoring_enabled = bool(parameters.get("quality_scoring"))
+    validation_enabled = bool(parameters.get("sql_validation")) or scoring_enabled
+    quality_enabled = validation_enabled
     query_planning_enabled = bool(parameters.get("query_planning"))
     query_plan_reasons = complex_query_reasons(item["question"])
+    plan_triggered = query_planning_enabled and should_plan(query_plan_reasons)
     query_plan = {
         "enabled": query_planning_enabled,
-        "triggered": query_planning_enabled and bool(query_plan_reasons),
-        "status": "pending"
-        if query_planning_enabled and query_plan_reasons
-        else "not_complex"
-        if query_planning_enabled
-        else "disabled",
+        "triggered": plan_triggered,
+        "status": "pending" if plan_triggered else "not_complex" if query_planning_enabled else "disabled",
         "trigger_reasons": query_plan_reasons,
     }
     retry_limit = int(parameters.get("quality_retry_limit", 1)) if quality_enabled else 0
     score_threshold = int(parameters.get("quality_score_threshold", 70))
     judge_model = str(parameters.get("quality_judge_model", "")).strip() or run["model"]
-    state = get_sql_review_graph().invoke(
-        {
+    initial_state: SQLReviewGraphState = {
+        **{
             "run": run,
             "item": item,
             "model": run["model"],
@@ -1593,6 +1540,8 @@ def generate_and_evaluate_experiment_item(run: sqlite3.Row, item: sqlite3.Row) -
             "question": item["question"],
             "gold_sql": item["gold_sql"],
             "quality_enabled": quality_enabled,
+            "validation_enabled": validation_enabled,
+            "scoring_enabled": scoring_enabled,
             "query_planning_enabled": query_planning_enabled,
             "query_plan": query_plan,
             "retry_limit": retry_limit,
@@ -1608,7 +1557,11 @@ def generate_and_evaluate_experiment_item(run: sqlite3.Row, item: sqlite3.Row) -
             "started_at": total_started,
             "fatal": False,
         }
-    )
+    }
+    if parameters.get("langgraph", True):
+        state = get_sql_review_graph().invoke(initial_state)
+    else:
+        state = run_sql_review_linear(initial_state)
     return state["result"]
 
 def persist_experiment_item_result(
@@ -1848,6 +1801,7 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
     model = body.model.strip()
     system_prompt = body.system_prompt.strip()
     quality_judge_model = body.quality_judge_model.strip() or model
+    use_validation = body.use_sql_validation or body.use_quality_scoring
     if not model:
         raise HTTPException(status_code=422, detail="模型 ID 不能为空")
     if not system_prompt:
@@ -1872,10 +1826,12 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
             "target_schema_enabled": target_schema_enabled,
             "query_planning": body.use_query_planning,
             "query_planning_version": QUERY_PLANNING_VERSION if body.use_query_planning else "",
+            "sql_validation": use_validation,
+            "langgraph": body.use_langgraph,
             "quality_scoring": body.use_quality_scoring,
             "quality_rubric_version": QUALITY_RUBRIC_VERSION if body.use_quality_scoring else "",
             "quality_score_threshold": body.quality_score_threshold if body.use_quality_scoring else None,
-            "quality_retry_limit": body.quality_retry_limit if body.use_quality_scoring else 0,
+            "quality_retry_limit": body.quality_retry_limit if use_validation else 0,
             "quality_judge_model": quality_judge_model if body.use_quality_scoring else "",
         },
         ensure_ascii=False,
@@ -1886,7 +1842,9 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
     run_parameters = {
         **GENERATION_PARAMS,
         "concurrency": MAX_GENERATION_CONCURRENCY,
-        "sql_review_engine": "langgraph-stategraph-v1",
+        "sql_review_engine": "langgraph-stategraph-v1" if body.use_langgraph else "linear-loop-v1",
+        "langgraph": body.use_langgraph,
+        "sql_validation": use_validation,
         "few_shot_requested": body.use_few_shot,
         "few_shot_enabled": few_shot_enabled,
         "few_shot_count": few_shot_count,
@@ -1898,7 +1856,7 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
         "quality_scoring": body.use_quality_scoring,
         "quality_rubric_version": QUALITY_RUBRIC_VERSION if body.use_quality_scoring else "",
         "quality_score_threshold": body.quality_score_threshold,
-        "quality_retry_limit": body.quality_retry_limit if body.use_quality_scoring else 0,
+        "quality_retry_limit": body.quality_retry_limit if use_validation else 0,
         "quality_judge_model": quality_judge_model if body.use_quality_scoring else "",
         "optimization_note": body.optimization_note.strip(),
         "optimization_log": [
@@ -1954,8 +1912,23 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
             {
                 "id": "langgraph-stategraph-v1",
                 "title": "LangGraph SQL 质控流程",
-                "applied": True,
-                "detail": "用 StateGraph 编排 SQL 生成、只读检查、语义评分、条件重试与候选选择。",
+                "applied": body.use_langgraph,
+                "detail": (
+                    "用 StateGraph 编排 SQL 生成、只读检查、语义评分、条件重试与候选选择。"
+                    if body.use_langgraph
+                    else "本轮未启用：改用等价的顺序循环执行相同节点。"
+                ),
+            },
+            {
+                "id": "sql-validation-v1",
+                "title": "SQL 执行校验与自动修复",
+                "applied": use_validation,
+                "detail": (
+                    "只读执行候选 SQL；报错、返回 0 行或全 NULL 时把错误作为反馈让模型修订，最多 "
+                    f"{body.quality_retry_limit} 次，并在候选中优先采用可执行且非空的结果（不调用评分模型）。"
+                    if use_validation and not body.use_quality_scoring
+                    else "与语义评分共用同一重试环节。" if use_validation else "本轮未启用。"
+                ),
             },
             {
                 "id": QUALITY_RUBRIC_VERSION,

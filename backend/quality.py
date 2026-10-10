@@ -104,13 +104,27 @@ def parse_quality_response(content: str) -> dict[str, Any]:
     }
 
 
+def result_sanity_issues(execution: dict[str, Any]) -> list[str]:
+    """Soft signals on an executable query: empty result or all-NULL result."""
+    if not execution.get("ok"):
+        return []
+    rows = execution.get("rows") or []
+    if int(execution.get("row_count", len(rows)) or 0) == 0:
+        return ["查询执行成功但返回 0 行：请核对过滤值（字面值/大小写/语言）、连接条件和是否过度限制。"]
+    if rows and all(all(value is None for value in row) for row in rows):
+        return ["查询返回的全是 NULL：请核对聚合对象、连接方向和所选字段。"]
+    return []
+
+
 def validation_checks(execution: dict[str, Any]) -> dict[str, Any]:
     if execution.get("ok"):
+        issues = result_sanity_issues(execution)
         return {
             "read_only": {"status": "pass", "evidence": "只读 authorizer 允许该查询"},
             "syntax": {"status": "pass", "evidence": "SQLite 成功解析并执行查询"},
             "schema": {"status": "pass", "evidence": "查询引用的表和字段可解析"},
             "execution": {"status": "pass", "evidence": f"返回 {execution.get('row_count', 0)} 行"},
+            "result_sanity": {"status": "warn" if issues else "pass", "evidence": issues[0] if issues else "结果非空"},
         }
 
     category = str(execution.get("category", "unknown"))
@@ -122,8 +136,6 @@ def validation_checks(execution: dict[str, Any]) -> dict[str, Any]:
         read_only_status, syntax_status, schema_status = "pass", "pass", "fail"
     elif any(term in normalized for term in ("syntax error", "unrecognized token", "incomplete input", 'near "')):
         read_only_status, syntax_status, schema_status = "pass", "fail", "unknown"
-    elif category == "sql_error":
-        read_only_status, syntax_status, schema_status = "pass", "unknown", "unknown"
     else:
         read_only_status, syntax_status, schema_status = "pass", "unknown", "unknown"
 
@@ -133,6 +145,43 @@ def validation_checks(execution: dict[str, Any]) -> dict[str, Any]:
         "syntax": {"status": syntax_status, "evidence": error},
         "schema": {"status": schema_status, "evidence": error},
         "execution": {"status": execution_status, "evidence": error},
+    }
+
+
+def validation_assessment(execution: dict[str, Any], execution_summary: dict[str, Any]) -> dict[str, Any]:
+    """Deterministic (no-LLM) assessment used when SQL validation is on but rubric scoring is off."""
+    checks = validation_checks(execution)
+    validation = {"checks": checks, "execution": execution_summary}
+    if deterministic_hard_failure(execution):
+        error = str(execution.get("error", "SQL 未通过确定性检查"))
+        return {
+            "score": 0,
+            "dimensions": {},
+            "issues": [error[:400]],
+            "feedback": f"上一版 SQL 执行报错，请据此修复：{error[:800]}",
+            "score_source": "validation",
+            "validation": validation,
+            "needs_repair": True,
+        }
+    issues = result_sanity_issues(execution)
+    if issues:
+        return {
+            "score": 60,
+            "dimensions": {},
+            "issues": issues,
+            "feedback": issues[0],
+            "score_source": "validation",
+            "validation": validation,
+            "needs_repair": True,
+        }
+    return {
+        "score": 100,
+        "dimensions": {},
+        "issues": [],
+        "feedback": "",
+        "score_source": "validation",
+        "validation": validation,
+        "needs_repair": False,
     }
 
 

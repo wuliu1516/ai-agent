@@ -74,6 +74,7 @@ button:disabled { cursor: not-allowed !important; opacity: .38; }
 .main-scroll { flex: 1; overflow: auto; }
 .page-wrap { width: min(1600px, 100%); min-height: 100%; margin: 0 auto; padding: 27px 31px 20px; }
 .stats-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 13px; margin-bottom: 30px; }
+.stats-grid[hidden] { display: none; }
 .stat-card { min-height: 107px; padding: 15px 17px; border: 1px solid #eaedf3; border-radius: 12px; background: #fff; box-shadow: 0 2px 5px rgba(39, 51, 69, .018); }
 .stat-top { display: flex; justify-content: space-between; align-items: center; color: #6e7785; font-size: 12px; }
 .stat-icon { width: 26px; height: 26px; display: grid; place-items: center; border-radius: 8px; }
@@ -294,7 +295,7 @@ button:disabled { cursor: not-allowed !important; opacity: .38; }
 .experiment-create-heading strong { display: block; color: #354356; font-size: 13px; }
 .experiment-create-heading small { display: block; margin-top: 4px; color: #707781; font-size: 11px; }
 .experiment-seed { padding: 5px 7px; border-radius: 6px; background: #f5f5fb; color: #71718b; font: 11px var(--mono); white-space: nowrap; }
-.experiment-create-fields { display: grid; grid-template-columns: minmax(135px, .8fr) minmax(170px, 1.1fr) minmax(115px, .55fr) minmax(190px, 1fr) auto; align-items: end; gap: 9px; }
+.experiment-create-fields { display: grid; grid-template-columns: minmax(135px, .8fr) minmax(190px, 1.2fr) minmax(115px, .55fr) auto; align-items: end; gap: 9px; }
 .experiment-create-fields .select-field { min-width: 0; }
 .experiment-create-fields .model-field { min-width: 0; }
 .sample-limit-field { position: relative; }
@@ -306,6 +307,20 @@ button:disabled { cursor: not-allowed !important; opacity: .38; }
 .few-shot-option strong { color: #485467; font-size: 11px; font-weight: 650; }
 .few-shot-option small { margin-top: 3px; color: #828b99; font-size: 11px; line-height: 1.3; }
 .experiment-start-button { min-height: 36px; padding: 0 13px; }
+.experiment-options { margin-top: 12px; border-top: 1px solid #eff1f5; color: #687486; }
+.experiment-options > summary { display: flex; align-items: center; gap: 9px; padding: 11px 1px 2px; cursor: pointer; list-style: none; }
+.experiment-options > summary::-webkit-details-marker { display: none; }
+.experiment-options > summary::after { content: '+'; margin-left: auto; color: #7b7ca3; font: 16px var(--mono); }
+.experiment-options[open] > summary::after { content: '−'; }
+.experiment-options > summary strong { color: #4e5b6e; font-size: 11px; font-weight: 650; }
+.experiment-options > summary span { color: #828b98; font-size: 11px; }
+.experiment-option-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; padding: 12px 1px 2px; }
+.experiment-option-grid .few-shot-option { align-items: flex-start; padding: 8px 9px; border: 1px solid #edf0f4; border-radius: 8px; background: #fcfcfd; }
+.experiment-option-grid .few-shot-option input { margin-top: 1px; }
+.experiment-options .quality-scoring-controls { margin-top: 10px; }
+.experiment-options .experiment-optimization-note { margin-top: 11px; }
+.experiment-options .experiment-method-note { margin-top: 8px; }
+.experiment-options .experiment-prompt-editor { margin-top: 11px; }
 .experiment-provider-note { margin-top: 11px; padding: 8px 10px; border: 1px solid #f0e4d6; border-radius: 7px; background: #fffaf3; color: #94734e; font-size: 11px; line-height: 1.5; }
 .experiment-provider-note.ready { border-color: #dcefe7; background: #f6fcf9; color: #45816b; }
 .experiment-optimization-note { display: grid; gap: 5px; margin-top: 10px; color: #5d6878; font-size: 11px; }
@@ -524,6 +539,8 @@ button:disabled { cursor: not-allowed !important; opacity: .38; }
   .sample-workspace { grid-template-columns: minmax(230px, .8fr) minmax(350px, 1.2fr); }
   .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 24px; }
   .experiment-create-fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .experiment-start-button { justify-self: start; }
+  .experiment-option-grid { grid-template-columns: 1fr; gap: 6px; }
   .experiment-start-button { width: auto; }
   .experiment-workspace { grid-template-columns: 1fr; }
 }
@@ -579,6 +596,8 @@ button:disabled { cursor: not-allowed !important; opacity: .38; }
   .experiment-create-fields .select-field, .experiment-create-fields .model-field { min-width: 0; }
   .few-shot-option { align-items: flex-start; padding: 8px 0; }
   .experiment-create-fields .experiment-start-button { grid-column: 1 / -1; width: 100%; }
+  .experiment-options > summary { align-items: flex-start; flex-wrap: wrap; gap: 4px 8px; }
+  .experiment-options > summary span { flex: 1 1 100%; }
   .experiment-seed { font-size: 11px; }
   .experiment-run-score { min-width: 73px; }
   .experiment-summary { padding: 12px; }
