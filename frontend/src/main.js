@@ -51,6 +51,9 @@ const state = {
   experimentItemPageSize: 30,
   selectedExperimentItemId: null,
   experimentItem: null,
+  fullRunSplit: 'test',
+  fullRunAId: '',
+  fullRunBId: '',
 }
 
 const app = document.querySelector('#app')
@@ -65,6 +68,7 @@ const requestSequence = { samples: 0, sample: 0, databases: 0, database: 0, tabl
 let experimentPollTimer
 let experimentPollBusy = false
 let experimentPollFailures = 0
+let fullRunCategoryRequestId = 0
 
 function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -539,21 +543,33 @@ function renderResultsView() {
       <div class="heading-summary"><strong id="experiment-run-count-summary">${fmt(state.experiments.length)}</strong><span>个运行批次</span></div>
     </div>
     <section class="experiment-create panel">
-      <div class="experiment-create-heading"><div><strong>启动基线运行</strong><small id="experiment-run-description">每条样本使用对应数据库 schema；最多 ${fmt(state.experimentConfig?.max_concurrency ?? 6)} 路并发生成；金标只用于运行后的评测。</small></div><span class="experiment-seed">固定抽样种子 42</span></div>
+      <div class="experiment-create-heading"><div><strong>启动批量运行</strong><small id="experiment-run-description">每条样本可选择是否提供目标题 Schema；最多 ${fmt(state.experimentConfig?.max_concurrency ?? 6)} 路并发生成；金标只用于运行后的评测。</small></div><span class="experiment-seed">固定抽样种子 42</span></div>
       <div class="experiment-create-fields">
         <label class="select-field"><span>数据集</span><select id="experiment-split">${Object.entries(splitLabels).map(([key, label]) => `<option value="${key}" ${key === 'development' ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
         <label class="model-field"><span>模型</span><input id="experiment-model" type="text" value="${esc(state.experimentConfig?.default_model || '')}" placeholder="填写已配置服务中的模型 ID" maxlength="250" /></label>
         <label class="model-field sample-limit-field"><span>样本数</span><input id="experiment-sample-limit" type="number" min="0" max="${state.experimentConfig?.max_samples || 10000}" value="20" /><small>0 表示整个划分</small></label>
+        <label class="few-shot-option"><input id="experiment-few-shot" type="checkbox" checked /><span><strong>相似示例（Few-shot）</strong><small>最多附 2 个 development 示例（只含问题 + SQL）；运行 development 时自动关闭</small></span></label>
+        <label class="few-shot-option"><input id="experiment-target-schema" type="checkbox" checked /><span><strong>提供目标题 Schema</strong><small>关闭后生成模型看不到目标表名、字段和外键；Few-shot 示例只有问题 + SQL</small></span></label>
+        <label class="few-shot-option"><input id="experiment-query-planning" type="checkbox" /><span><strong>复杂问题先生成查询计划</strong><small>聚合/分组、比较/排名、多条件或嵌套问题触发；计划节点多调用一次模型</small></span></label>
       <button class="primary-button experiment-start-button" data-action="start-experiment" ${experimentStartPending || experimentHistoryLoading || !experimentHistoryLoaded || state.experiments.some((run) => ['queued', 'running'].includes(run.status)) || !state.experimentConfig?.provider_ready || !state.experimentConfig?.default_model ? 'disabled' : ''}>${experimentStartPending ? '<span class="spinner small"></span>正在创建批次' : `${icon('arrow', 16)}开始批量运行`}</button>
       </div>
+      <div class="quality-scoring-controls">
+        <label class="few-shot-option quality-scoring-toggle"><input id="experiment-quality-scoring" type="checkbox" checked /><span><strong>语义评分与低分修订</strong><small>评分器只看问题、schema、SQL 和执行证据，不看金标；低于阈值时带反馈重试</small></span></label>
+        <label class="quality-number-field"><span>重试阈值</span><input id="experiment-quality-threshold" type="number" min="0" max="100" value="70" /><small>分（0–100）</small></label>
+        <label class="quality-number-field"><span>最多修订次数</span><input id="experiment-quality-retries" type="number" min="0" max="2" value="1" /><small>每题最多 2 次</small></label>
+        <label class="quality-model-field"><span>评分模型</span><input id="experiment-quality-judge-model" type="text" value="" placeholder="留空时使用生成模型" maxlength="250" /><small>空值默认与生成模型相同</small></label>
+      </div>
       <div id="experiment-provider-note" class="experiment-provider-note ${state.experimentConfig?.provider_ready ? 'ready' : ''}">${state.experimentConfig?.provider_ready ? `模型服务地址已配置 · ${esc(state.experimentConfig.base_url)} · 实际可用性以批次结果为准` : state.experimentConfig?.configuration_error ? `模型服务配置错误：${esc(state.experimentConfig.configuration_error)}` : '请在 backend/.env 中配置 NL2SQL_API_BASE_URL；服务启用鉴权时再填写 NL2SQL_API_KEY。'}</div>
-      <div class="experiment-method-note">评测使用只读查询结果比对；测试集可单独运行。若根据测试集错误反复调整 Prompt，这组数据也会参与调参。</div>
+      <label class="experiment-optimization-note"><span>本轮优化备注</span><textarea id="experiment-optimization-note" maxlength="2000" placeholder="例如：本轮新增 Few-shot；从 development 检索最多 2 个可执行示例。"></textarea><small>备注与自动记录的 Prompt、Few-shot、SQL 输出清理设置会随批次保存。</small></label>
+      <div class="experiment-method-note">Few-shot 示例只从 development 集检索，并跳过无法执行或无有效结果的 SQL；测试集可单独运行。若根据测试集错误反复调整 Prompt，这组数据也会参与调参。</div>
       <details class="experiment-prompt-editor"><summary>本轮 System Prompt（可编辑，逐条保存实际 Prompt）</summary><textarea id="experiment-system-prompt" spellcheck="false">${esc(state.experimentConfig?.default_system_prompt || '')}</textarea></details>
-    </div>
+    </section>
     <section class="experiment-history panel"><div class="panel-heading"><div><strong>运行批次</strong><span id="experiment-runs-count" class="subtle-count"></span></div><span class="list-sort">最近运行在前</span></div><div id="experiment-run-list" class="experiment-run-list"><div class="list-loading"><span class="spinner small"></span>读取批次中</div></div></section>
     <section id="experiment-review" class="experiment-review"></section>
+    <section class="full-test-problem-categories panel"><div class="panel-heading"><div><strong id="full-run-comparison-title">最近两轮全量测试 · 问题类别统计</strong><span class="subtle-count">默认比较同一数据集最近两轮，可自行选择批次</span></div></div><div id="full-test-problem-category-content"><div class="list-loading"><span class="spinner small"></span>统计中</div></div></section>
   `
   loadExperiments().catch(showExperimentHistoryError)
+  loadFullTestProblemCategories()
 }
 
 const experimentStatusLabels = {
@@ -583,6 +599,69 @@ function renderExperimentRunList() {
   `).join('')
 }
 
+function renderFullTestProblemCategories(data) {
+  const container = document.querySelector('#full-test-problem-category-content')
+  if (!container) return
+  const runs = Array.isArray(data.runs) ? data.runs : []
+  const availableRuns = Array.isArray(data.available_runs) ? data.available_runs : []
+  state.fullRunSplit = data.split || state.fullRunSplit
+  state.fullRunAId = data.selected_run_ids?.[0] || ''
+  state.fullRunBId = data.selected_run_ids?.[1] || ''
+  const title = document.querySelector('#full-run-comparison-title')
+  if (title) title.textContent = `最近两轮全量${state.fullRunSplit === 'test' ? '测试' : '验证'} · 问题类别统计`
+  const optionLabel = (run) => `${formatDate(run.created_at)} · ${run.model} · ${run.run_id}`
+  const runSelect = (label, id, selectedId, otherSelectedId) => {
+    const selectableRuns = availableRuns.filter((run) => run.run_id !== otherSelectedId)
+    const options = selectableRuns.length
+      ? selectableRuns.map((run) => `<option value="${esc(run.run_id)}" ${run.run_id === selectedId ? 'selected' : ''}>${esc(optionLabel(run))}</option>`).join('')
+      : '<option value="">暂无可比较批次</option>'
+    return `<label class="category-run-select"><span>${label}</span><select id="${id}" ${selectableRuns.length ? '' : 'disabled'}>${options}</select></label>`
+  }
+  const controls = `<div class="category-comparison-controls"><label class="category-run-select category-dataset-select"><span>数据集</span><select id="full-run-split"><option value="test" ${state.fullRunSplit === 'test' ? 'selected' : ''}>测试集</option><option value="validation" ${state.fullRunSplit === 'validation' ? 'selected' : ''}>验证集</option></select></label>${runSelect('批次 A', 'full-run-a', state.fullRunAId, state.fullRunBId)}${runSelect('批次 B', 'full-run-b', state.fullRunBId, state.fullRunAId)}</div>`
+  if (!runs.length) {
+    const splitLabel = splitLabels[state.fullRunSplit] || state.fullRunSplit
+    container.innerHTML = `${controls}<div class="empty-inline small-empty"><strong>${esc(splitLabel)}还没有全量测评批次</strong><small>完成一轮覆盖全部样本的测评后，这里会显示诊断统计。</small></div>`
+    return
+  }
+  const [runA, runB] = runs
+  const categoryRows = (data.categories || []).map((category) => {
+    const current = category.runs?.[0] || {}
+    const older = category.runs?.[1] || {}
+    const delta = Number(category.delta || 0)
+    const deltaLabel = delta > 0 ? `+${fmt(delta)}` : delta < 0 ? `−${fmt(Math.abs(delta))}` : '0'
+    const deltaClass = delta > 0 ? 'category-delta-up' : delta < 0 ? 'category-delta-down' : ''
+    const cell = (counts) => `${fmt(counts.incorrect || 0)} / ${fmt(counts.unjudged || 0)} / ${fmt(counts.generation_failed || 0)}`
+    return `<tr><th scope="row">${esc(category.title || category.category)}</th><td>${cell(current)}</td>${runB ? `<td>${cell(older)}</td><td class="${deltaClass}">${deltaLabel}</td>` : ''}</tr>`
+  }).join('')
+  const runHeader = (run) => `<strong>${esc(run.run_id)}</strong><small>${esc(run.model)} · ${esc(formatDate(run.created_at))}</small>`
+  const runMetric = (run, label) => `<div class="category-run-metric"><span>${label} · 执行一致率</span><strong>${run.accuracy == null ? '—' : `${(run.accuracy * 100).toFixed(2)}%`}</strong><small>${fmt(run.counts?.incorrect || 0)} 错误 · ${fmt(run.counts?.unjudged || 0)} 无法判定 · ${fmt(run.counts?.generation_failed || 0)} 生成失败</small></div>`
+  const tableEmpty = runB ? '这两个批次都没有诊断到问题类别。' : '这一批次没有诊断到问题类别。'
+  const tableColumns = `<th>问题类别</th><th>${runHeader(runA)}<small>错误 / 无法判定 / 生成失败</small></th>${runB ? `<th>${runHeader(runB)}<small>错误 / 无法判定 / 生成失败</small></th><th>批次 A − 批次 B</th>` : ''}`
+  const emptyRow = `<tr><td colspan="${runB ? 4 : 2}">${tableEmpty}</td></tr>`
+  const comparisonNote = runB ? '变化值为批次 A 各类别样本数减去批次 B。' : '选择第二个全量批次后即可比较两轮变化。'
+  container.innerHTML = `
+    ${controls}
+    <div class="category-run-overview">${runMetric(runA, '批次 A')}${runB ? runMetric(runB, '批次 B') : ''}</div>
+    <div class="category-comparison-scroll"><table class="category-comparison-table"><thead><tr>${tableColumns}</tr></thead><tbody>${categoryRows || emptyRow}</tbody></table></div>
+    <p class="category-comparison-note">${esc(data.category_method || '每个诊断类别按受影响样本数计数；同一样本可能属于多个类别。')} ${comparisonNote}</p>
+  `
+}
+
+async function loadFullTestProblemCategories() {
+  const container = document.querySelector('#full-test-problem-category-content')
+  if (!container) return
+  const requestId = ++fullRunCategoryRequestId
+  try {
+    const params = new URLSearchParams({ split: state.fullRunSplit })
+    if (state.fullRunAId) params.set('run_a_id', state.fullRunAId)
+    if (state.fullRunBId) params.set('run_b_id', state.fullRunBId)
+    const data = await request(`/experiment-analytics/full-test-problem-categories?${params}`)
+    if (container.isConnected && requestId === fullRunCategoryRequestId) renderFullTestProblemCategories(data)
+  } catch (error) {
+    if (container.isConnected && requestId === fullRunCategoryRequestId) container.innerHTML = `<div class="empty-inline small-empty"><strong>问题类别统计读取失败</strong><small>${esc(error.message)}</small></div>`
+  }
+}
+
 function renderExperimentSummary() {
   const container = document.querySelector('#experiment-review')
   const run = state.experiment
@@ -595,11 +674,28 @@ function renderExperimentSummary() {
   const processed = (counts.correct || 0) + (counts.incorrect || 0) + (counts.unjudged || 0) + (counts.generation_failed || 0) + (counts.interrupted || 0)
   const progress = run.total_count ? Math.min(100, Math.round(processed / run.total_count * 100)) : 0
   const accuracy = run.accuracy == null ? '—' : `${(run.accuracy * 100).toFixed(1)}%`
+  const fewShotLabel = run.parameters?.few_shot_enabled
+    ? `最多 ${fmt(run.parameters.few_shot_count)} 个示例（${esc(run.parameters.few_shot_source_split || 'development')}）`
+    : run.parameters?.few_shot_requested ? '开发集批次自动关闭' : '关闭'
+  const targetSchemaLabel = run.parameters?.target_schema_enabled === false ? '关闭' : '开启'
+  const optimizationLog = Array.isArray(run.parameters?.optimization_log) ? run.parameters.optimization_log : []
+  const optimizationNote = String(run.parameters?.optimization_note || '').trim()
+  const quality = run.quality_summary || {}
+  const qualityReport = run.parameters?.quality_scoring
+    ? '<section class="quality-run-summary"><div class="quality-run-summary-heading"><strong>Rubric 评分区分能力</strong><small>初始 SQL 分数与执行正确/错误标签比较</small></div><div class="quality-run-summary-metrics">' +
+      '<div><span>AUC</span><strong>' + (quality.rubric_auc == null ? '样本不足' : Number(quality.rubric_auc).toFixed(3)) + '</strong><small>' + fmt(quality.rubric_correct_samples || 0) + ' 条正确 · ' + fmt(quality.rubric_incorrect_samples || 0) + ' 条错误</small></div>' +
+      '<div><span>初始 Rubric 均分</span><strong>' + (quality.rubric_mean_correct == null || quality.rubric_mean_incorrect == null ? '—' : Number(quality.rubric_mean_correct).toFixed(1) + ' / ' + Number(quality.rubric_mean_incorrect).toFixed(1)) + '</strong><small>正确 / 错误；AUC 只计 Rubric 评分样本</small></div>' +
+      '<div><span>低分修订</span><strong>' + fmt(quality.retry_samples || 0) + '</strong><small>修复 ' + fmt(quality.retry_recovered || 0) + ' 条 · 退化 ' + fmt(quality.retry_regressed || 0) + ' 条</small></div>' +
+      '<div><span>确定性拦截</span><strong>' + fmt(quality.deterministic_rejects || 0) + '</strong><small>' + fmt(quality.judge_errors || 0) + ' 条评分调用失败</small></div>' +
+      '</div><p>AUC 约 0.5 表示和随机排序接近，1.0 表示区分更强；小样本结果仅作试验参考。</p></section>'
+    : ''
   const markup = `
     <section class="experiment-summary panel">
-      <div class="experiment-summary-top"><div><div class="eyebrow">${esc(splitLabels[run.split] || run.split)} · ${esc(run.run_id)}</div><h2>${esc(run.model)}</h2><p>Prompt ${esc(run.prompt_version)} · ${run.full_dataset ? '全量样本' : `${fmt(run.total_count)} 条固定抽样`} · 并发 ${fmt(run.parameters?.concurrency ?? 1)} 路 · temperature=${esc(run.parameters?.temperature ?? 0)} · max_tokens=${esc(run.parameters?.max_tokens ?? 2048)} · ${esc(formatDate(run.created_at))}</p></div><div class="experiment-summary-actions"><span class="run-state state-${esc(run.status)}">${esc(experimentStatusLabels[run.status] || run.status)}</span>${['queued', 'running'].includes(run.status) ? `<button class="outline-button" data-action="cancel-experiment" data-run-id="${esc(run.run_id)}">停止运行</button>` : ''}</div></div>
+      <div class="experiment-summary-top"><div><div class="eyebrow">${esc(splitLabels[run.split] || run.split)} · ${esc(run.run_id)}</div><h2>${esc(run.model)}</h2><p>Prompt ${esc(run.prompt_version)} · Few-shot ${fewShotLabel} · 目标题 Schema ${targetSchemaLabel} · ${run.full_dataset ? '全量样本' : `${fmt(run.total_count)} 条固定抽样`} · 并发 ${fmt(run.parameters?.concurrency ?? 1)} 路 · temperature=${esc(run.parameters?.temperature ?? 0)} · max_tokens=${esc(run.parameters?.max_tokens ?? 2048)} · ${esc(formatDate(run.created_at))}</p></div><div class="experiment-summary-actions"><span class="run-state state-${esc(run.status)}">${esc(experimentStatusLabels[run.status] || run.status)}</span>${['queued', 'running'].includes(run.status) ? `<button class="outline-button" data-action="cancel-experiment" data-run-id="${esc(run.run_id)}">停止运行</button>` : ''}</div></div>
       <div class="experiment-progress"><span style="width:${progress}%"></span></div><div class="experiment-progress-caption"><span>${fmt(processed)} / ${fmt(run.total_count)} 条已处理</span><span class="experiment-progress-live"><span>排队中 ${fmt(counts.queued)}</span><span>生成中 ${fmt(counts.generating)}</span></span><span>${progress}%</span></div>
       <div class="experiment-metrics"><div><span>结果一致</span><strong>${fmt(counts.correct)}</strong></div><div><span>结果不一致</span><strong>${fmt(counts.incorrect)}</strong></div><div><span>无法判定</span><strong>${fmt(counts.unjudged)}</strong></div><div><span>生成失败</span><strong>${fmt(counts.generation_failed)}</strong></div><div><span>运行中断</span><strong>${fmt(counts.interrupted)}</strong></div><div><span>未运行</span><strong>${fmt(counts.not_run)}</strong></div><div><span>待运行</span><strong>${fmt(counts.pending)}</strong></div><div><span>执行准确率</span><strong>${accuracy}</strong><small>仅在可判定样本中计算</small></div></div>
+      ${qualityReport}
+      <section class="experiment-optimization-log"><div class="optimization-log-heading"><strong>本轮优化记录</strong><span>随批次保存</span></div>${optimizationLog.length ? `<ul>${optimizationLog.map((entry) => `<li class="${entry.applied ? 'applied' : 'not-applied'}"><span class="optimization-log-state">${entry.applied ? '已启用' : '未启用'}</span><div><strong>${esc(entry.title || entry.id || '优化项')}</strong><small>${esc(entry.detail || '')}</small></div></li>`).join('')}</ul>` : '<p class="optimization-log-empty">该历史批次未保存结构化优化记录。</p>'}${optimizationNote ? `<div class="optimization-log-note"><strong>备注</strong><p>${esc(optimizationNote)}</p></div>` : ''}</section>
       ${run.error_message ? `<div class="experiment-run-error">${esc(run.error_message)}</div>` : ''}
       <details class="experiment-system-snapshot"><summary>查看本轮 System Prompt</summary><pre>${esc(run.system_prompt || '')}</pre></details>
     </section>
@@ -649,7 +745,8 @@ function renderExperimentItems({ preserveScroll = true } = {}) {
     const label = item.evaluation_status === 'pending'
       ? evaluationStatusLabels[item.item_status] || '待运行'
       : evaluationStatusLabels[item.evaluation_status] || evaluationStatusLabels[status] || status
-    return `<tr class="${item.item_id === state.selectedExperimentItemId ? 'active' : ''}" data-experiment-item="${item.item_id}"><td><code>#${String(item.sample_index + 1).padStart(4, '0')}</code><small>${esc(item.db_id)}</small></td><td><span class="evaluation-badge eval-${esc(status)}">${esc(label)}</span></td><td class="experiment-list-question"><strong>${esc(item.question)}</strong><small>${esc(item.reason_title || (item.item_status === 'queued' ? '等待运行' : '初步判断待生成'))}</small></td><td>${item.latency_ms == null ? '—' : `${esc(item.latency_ms)} ms`}</td></tr>`
+    const scoreLabel = item.quality_score == null ? '' : ` · 质量分 ${esc(item.quality_score)}`
+    return `<tr class="${item.item_id === state.selectedExperimentItemId ? 'active' : ''}" data-experiment-item="${item.item_id}"><td><code>#${String(item.sample_index + 1).padStart(4, '0')}</code><small>${esc(item.db_id)}</small></td><td><span class="evaluation-badge eval-${esc(status)}">${esc(label)}</span></td><td class="experiment-list-question"><strong>${esc(item.question)}</strong><small>${esc(item.reason_title || (item.item_status === 'queued' ? '等待运行' : '初步判断待生成'))}${scoreLabel}</small></td><td>${item.latency_ms == null ? '—' : `${esc(item.latency_ms)} ms`}</td></tr>`
   }).join('')}</tbody></table></div>`
   const nextScrollContainer = table.querySelector('.experiment-items-scroll')
   if (nextScrollContainer) nextScrollContainer.scrollTop = previousScrollTop
@@ -666,6 +763,25 @@ function renderResultPreview(title, summary) {
   return `<section class="evaluation-preview"><div><strong>${esc(title)}</strong><span>${fmt(summary.row_count)} 行${summary.truncated_preview ? ' · 仅展示前 12 行' : ''}</span></div>${body}</section>`
 }
 
+function renderQualityAssessment(assessment) {
+  if (!assessment?.enabled) return ''
+  const statusLabels = { pass: '通过', fail: '失败', unknown: '未判定', partial: '未完整执行' }
+  const attempts = Array.isArray(assessment.attempts) ? assessment.attempts : []
+  const attemptCards = attempts.map((attempt) => {
+    const validation = attempt.validation?.checks || {}
+    const checks = Object.entries(validation).map(([key, check]) => {
+      const labels = { read_only: '只读', syntax: '语法', schema: 'Schema', execution: '执行' }
+      return `<span class="quality-check quality-check-${esc(check.status)}"><strong>${esc(labels[key] || key)}：${esc(statusLabels[check.status] || check.status)}</strong><small>${esc(check.evidence || '')}</small></span>`
+    }).join('')
+    const issues = (attempt.issues || []).map((issue) => `<li>${esc(issue)}</li>`).join('')
+    const source = attempt.score_source === 'deterministic' ? '确定性校验分' : attempt.score_source === 'llm_rubric' ? 'Rubric 评分' : '评分不可用'
+    const benchmark = attempt.benchmark_status ? evaluationStatusLabels[attempt.benchmark_status] || attempt.benchmark_status : '评测中'
+    const dimensions = Object.entries(attempt.dimensions || {}).map(([key, value]) => `<span>${esc(key.replaceAll('_', ' '))} <b>${esc(value)}</b></span>`).join('')
+    return `<article class="quality-attempt"><div class="quality-attempt-heading"><strong>第 ${fmt(attempt.attempt)} 次 · ${attempt.score == null ? '评分失败' : `${fmt(attempt.score)} / 100`}</strong><span>${esc(source)} · ${esc(benchmark)}${assessment.selected_attempt === attempt.attempt ? ' · 采用' : ''}</span></div><div class="quality-checks">${checks}</div>${dimensions ? `<div class="quality-dimensions">${dimensions}</div>` : ''}${attempt.grader_error ? `<p class="quality-grader-error">${esc(attempt.grader_error)}</p>` : ''}${issues ? `<ul class="quality-issues">${issues}</ul>` : ''}${attempt.feedback ? `<p class="quality-feedback">${esc(attempt.feedback)}</p>` : ''}<pre class="review-sql generated">${esc(attempt.sql || '')}</pre></article>`
+  }).join('')
+  return `<article class="review-section panel quality-assessment"><div class="review-section-heading"><strong>SQL 校验与质量评分</strong><small>阈值 ${fmt(assessment.threshold)} · 已修订 ${fmt(assessment.retries_used)} 次 · 评分器 ${esc(assessment.judge_model || '')}</small></div><div class="quality-attempt-list">${attemptCards || '<div class="empty-inline small-empty">暂无评分结果。</div>'}</div>${assessment.retry_generation_errors?.length ? `<p class="quality-grader-error">修订生成错误：${esc(assessment.retry_generation_errors.join('；'))}</p>` : ''}</article>`
+}
+
 function renderExperimentItemDetail() {
   const container = document.querySelector('#experiment-item-detail')
   const item = state.experimentItem
@@ -678,16 +794,26 @@ function renderExperimentItemDetail() {
   const messages = item.prompt?.messages || []
   const systemPrompt = messages.find((message) => message.role === 'system')?.content || ''
   const userPrompt = messages.find((message) => message.role === 'user')?.content || ''
+  const queryPlan = item.prompt?.query_plan
+  const queryPlanStatus = !queryPlan?.enabled
+    ? '本轮未启用'
+    : !queryPlan.triggered
+      ? '已启用，本题未命中复杂问题规则'
+      : `已触发 · ${(queryPlan.trigger_reasons || []).map(esc).join('、')}${queryPlan.status === 'generated_unstructured' ? ' · 计划未遵循 JSON 格式' : ''}`
+  const queryPlanContent = queryPlan ? `<article class="review-section panel"><div class="review-section-heading"><strong>查询计划节点</strong><small>${queryPlanStatus}</small></div>${queryPlan.plan ? `<pre class="review-sql">${esc(JSON.stringify(queryPlan.plan, null, 2))}</pre>` : ''}${queryPlan.error ? `<p class="quality-grader-error">计划失败，已回退直接生成：${esc(queryPlan.error)}</p>` : ''}${queryPlan.planner_prompt ? `<details class="experiment-system-snapshot"><summary>查看计划节点 Prompt</summary><div class="actual-prompt"><div><span>system</span><pre>${esc(queryPlan.planner_prompt.system || '')}</pre></div><div><span>user</span><pre>${esc(queryPlan.planner_prompt.user || '')}</pre></div></div></details>` : ''}</article>` : ''
   const diagnosis = item.diagnosis || []
   const diagnosisContent = diagnosis.length ? diagnosis.map((reason) => `<article class="diagnosis-card diagnosis-${esc(reason.category)}"><strong>${esc(reason.title)}</strong><p>${esc(reason.evidence)}</p></article>`).join('') : `<div class="empty-inline small-empty"><strong>${item.item_status === 'queued' ? '等待模型运行' : '暂无判断依据'}</strong></div>`
   const diff = item.diff || {}
   const diffContent = Object.keys(diff).length ? `<div class="evaluation-diff-note">生成结果 ${fmt(diff.predicted_row_count || 0)} 行 · 金标结果 ${fmt(diff.gold_row_count || 0)} 行${diff.row_match?.row_index != null ? ` · 第 ${fmt(diff.row_match.row_index + 1)} 行首次不同` : ''}</div>` : ''
   const generatedSqlContent = item.generated_sql || item.generation_error || (item.item_status === 'not_run' ? '该样本未运行' : item.item_status === 'interrupted' ? '运行中断' : item.item_status === 'queued' || item.item_status === 'generating' ? '等待生成 SQL' : '模型未返回 SQL')
+  const qualityAssessmentContent = renderQualityAssessment(item.quality_assessment)
   container.innerHTML = `
     <article class="review-detail-header panel"><div class="detail-title-row"><div><div class="eyebrow">${esc(splitLabels[item.split] || state.experiment?.split || '')} / SAMPLE #${String(item.sample_index + 1).padStart(4, '0')}</div><h2>${esc(item.db_id)}</h2></div><span class="evaluation-badge eval-${esc(status)}">${esc(evaluationStatusLabels[status] || (item.item_status === 'generating' ? '生成中' : status))}</span></div><div class="review-question"><span>自然语言问题</span><p>${esc(item.question)}</p></div></article>
     <article class="review-section panel"><div class="review-section-heading"><strong>初步原因与证据</strong><small>规则依据执行错误和结果差异生成，供人工确认</small></div><div class="diagnosis-list">${diagnosisContent}</div>${diffContent}</article>
     <article class="review-section panel"><div class="review-section-heading"><strong>金标 SQL</strong><small>来自对应样本 JSON.query</small></div><pre class="review-sql">${esc(item.gold_sql || '暂无金标 SQL')}</pre></article>
+    ${queryPlanContent}
     <article class="review-section panel"><div class="review-section-heading"><strong>生成 SQL</strong><small>${item.model ? esc(item.model) : '模型未返回 SQL'}${item.latency_ms == null ? '' : ` · ${esc(item.latency_ms)} ms`}</small></div><pre class="review-sql generated">${esc(generatedSqlContent)}</pre></article>
+    ${qualityAssessmentContent}
     <article class="review-section panel"><div class="review-section-heading"><strong>本次实际发送的 Prompt</strong><small>包含 system 与 user 消息，不含金标</small></div><div class="actual-prompt"><div><span>system</span><pre>${esc(systemPrompt || '暂无')}</pre></div><div><span>user</span><pre>${esc(userPrompt || '暂无')}</pre></div></div></article>
     ${item.prediction_summary?.ok || item.prediction_summary?.error ? `<article class="review-section panel"><div class="review-section-heading"><strong>执行结果对照</strong><small>单个数据库上的执行结果比较</small></div>${diffContent}${renderResultPreview('生成 SQL 结果', item.prediction_summary)}${renderResultPreview('金标 SQL 结果', item.gold_summary)}</article>` : ''}
   `
@@ -739,7 +865,7 @@ async function loadExperiments() {
     if (modelInput && !modelInput.value && config.default_model) modelInput.value = config.default_model
     if (promptInput && !promptInput.value) promptInput.value = config.default_system_prompt || ''
     const runDescription = document.querySelector('#experiment-run-description')
-    if (runDescription) runDescription.textContent = `每条样本使用对应数据库 schema；最多 ${fmt(config.max_concurrency ?? 6)} 路并发生成；金标只用于运行后的评测。`
+    if (runDescription) runDescription.textContent = `每条样本可选择是否提供目标题 Schema；最多 ${fmt(config.max_concurrency ?? 6)} 路并发生成；金标只用于运行后的评测。`
     const note = document.querySelector('#experiment-provider-note')
     if (note) {
       note.classList.toggle('ready', config.provider_ready)
@@ -879,6 +1005,7 @@ function scheduleExperimentPoll(delay = 2500) {
       state.experiments = history.items || state.experiments
       renderExperimentRunList()
       updateExperimentStartButton()
+      if (response.status === 'completed') await loadFullTestProblemCategories()
       experimentPollFailures = 0
       scheduleExperimentPoll()
     } catch (error) {
@@ -916,6 +1043,14 @@ async function startExperiment() {
         model,
         sample_limit: sampleLimit,
         sample_seed: 42,
+        use_few_shot: document.querySelector('#experiment-few-shot')?.checked ?? true,
+        use_target_schema: document.querySelector('#experiment-target-schema')?.checked ?? true,
+        use_query_planning: document.querySelector('#experiment-query-planning')?.checked ?? false,
+        use_quality_scoring: document.querySelector('#experiment-quality-scoring')?.checked ?? false,
+        quality_score_threshold: Number(document.querySelector('#experiment-quality-threshold')?.value || 70),
+        quality_retry_limit: Number(document.querySelector('#experiment-quality-retries')?.value || 0),
+        quality_judge_model: document.querySelector('#experiment-quality-judge-model')?.value.trim() || '',
+        optimization_note: document.querySelector('#experiment-optimization-note')?.value.trim() || '',
         system_prompt: systemPrompt,
       }),
     })
@@ -1276,6 +1411,23 @@ document.addEventListener('input', (event) => {
 
 document.addEventListener('change', (event) => {
   const target = event.target
+  if (target.id === 'full-run-split') {
+    state.fullRunSplit = target.value
+    state.fullRunAId = ''
+    state.fullRunBId = ''
+    loadFullTestProblemCategories()
+  }
+  if (target.id === 'full-run-a') {
+    state.fullRunAId = target.value
+    loadFullTestProblemCategories()
+  }
+  if (target.id === 'full-run-b') {
+    state.fullRunBId = target.value
+    loadFullTestProblemCategories()
+  }
+  if (target.id === 'experiment-split' && target.value === 'development' && document.querySelector('#experiment-few-shot')?.checked) {
+    showToast('development 集用作 Few-shot 示例库；该划分运行会自动关闭 Few-shot。')
+  }
   if (target.id === 'experiment-item-status') {
     state.experimentItemStatus = target.value
     state.experimentItemPage = 1

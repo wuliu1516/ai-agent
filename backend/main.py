@@ -16,15 +16,27 @@ from collections import Counter, defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import quote, urlsplit, urlunsplit
 
+from langgraph.graph import END, START, StateGraph
 import psutil
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from .fewshot import FewShotRetriever
+from .quality import (
+    QUALITY_RUBRIC_SYSTEM_PROMPT,
+    QUALITY_RUBRIC_VERSION,
+    deterministic_hard_failure,
+    parse_quality_response,
+    quality_discrimination_summary,
+    score_quality_prompt,
+    validation_checks,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,14 +67,20 @@ MAX_CONSECUTIVE_MODEL_FAILURES = 3
 MAX_EVAL_ROWS = 5_000
 MAX_EVAL_SECONDS = 8
 RESULT_PREVIEW_ROWS = 12
+FEWSHOT_EXAMPLE_COUNT = 2
+FEWSHOT_RETRIEVAL_VERSION = "bm25-char-ngrams-v3-question-sql-only"
+QUERY_PLANNING_VERSION = "complex-query-plan-v1"
 GENERATION_PARAMS = {"temperature": 0, "max_tokens": 2048}
+QUERY_PLAN_SYSTEM_PROMPT = """你是一个 Text-to-SQL 查询规划器。根据用户问题和目标 Schema，整理生成 SQL 所需的结构化计划。
+只输出一个 JSON 对象，字段必须包含 target_fields、filters、tables_and_joins、aggregation_grouping、sorting_limit。每个字段用简短字符串或字符串数组表达；没有相关内容时用空字符串或空数组。不要输出 SQL、Markdown 或解释。严格依据问题和 Schema；不确定时明确写出不确定，不要臆造表、字段、值或关联关系。"""
 BASELINE_SYSTEM_PROMPT = """你是一个严谨的 Text-to-SQL 助手。请根据用户的问题和给出的数据库结构生成 SQL。
 必须遵循以下规则：
 1. 只使用提供的表名和字段名，不要臆造数据库结构。
 2. 表之间需要关联时，优先遵循 schema 中给出的外键关系。
 3. 使用 SQLite 方言，生成一条只读 SELECT 查询（允许 WITH ... SELECT）。
 4. 最终答复只能是一条 SQL 语句；不要输出推理过程、分析说明或任何 <think> / </think> 标记。
-5. 不要使用 Markdown 代码围栏，不要添加“SQL:”等前后缀文字，也不要输出多条语句。"""
+5. SELECT 只包含回答问题所需的字段，不要额外添加姓名、ID 或描述列。
+6. 不要使用 Markdown 代码围栏，不要添加“SQL:”等前后缀文字，也不要输出多条语句。"""
 
 
 def public_table_count(schema: dict[str, Any]) -> int:
@@ -224,12 +242,16 @@ def initialize_state_schema() -> None:
             prediction_summary_json TEXT NOT NULL DEFAULT '{}',
             gold_summary_json TEXT NOT NULL DEFAULT '{}',
             diff_json TEXT NOT NULL DEFAULT '{}',
+            quality_assessment_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL,
             completed_at TEXT NOT NULL DEFAULT '',
             UNIQUE(run_id, sample_index)
         )
         """
     )
+    item_columns = {row["name"] for row in connection.execute("PRAGMA table_info(experiment_items)").fetchall()}
+    if "quality_assessment_json" not in item_columns:
+        connection.execute("ALTER TABLE experiment_items ADD COLUMN quality_assessment_json TEXT NOT NULL DEFAULT '{}'")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_experiment_runs_created ON experiment_runs(created_at DESC)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_experiment_items_run ON experiment_items(run_id, sample_index)")
     connection.execute("CREATE INDEX IF NOT EXISTS idx_experiment_items_status ON experiment_items(run_id, evaluation_status)")
@@ -384,6 +406,14 @@ class ExperimentInput(BaseModel):
     model: str = Field(min_length=1, max_length=250)
     sample_limit: int = Field(default=20, ge=0, le=MAX_EXPERIMENT_SAMPLES)
     sample_seed: int = Field(default=42, ge=0, le=2_147_483_647)
+    use_few_shot: bool = True
+    use_target_schema: bool = True
+    use_query_planning: bool = False
+    use_quality_scoring: bool = False
+    quality_score_threshold: int = Field(default=70, ge=0, le=100)
+    quality_retry_limit: int = Field(default=1, ge=0, le=2)
+    quality_judge_model: str = Field(default="", max_length=250)
+    optimization_note: str = Field(default="", max_length=2_000)
     system_prompt: str = Field(default=BASELINE_SYSTEM_PROMPT, min_length=1, max_length=30_000)
 
 
@@ -427,16 +457,105 @@ def compact_schema_prompt(db_id: str) -> str:
     return schema_text
 
 
-def build_prompt(db_id: str, question: str) -> tuple[str, str]:
-    user_prompt = (
-        f"Database: {db_id}\n"
-        "SQL dialect: SQLite\n"
-        "Schema:\n"
-        f"{compact_schema_prompt(db_id)}\n\n"
-        f"Question:\n{question}\n\n"
+def build_prompt(
+    db_id: str,
+    question: str,
+    few_shot_count: int = 0,
+    include_target_schema: bool = True,
+) -> tuple[str, str]:
+    demonstrations = FEWSHOT_RETRIEVER.retrieve(db_id, question, few_shot_count) if few_shot_count else []
+    prompt_sections: list[str] = []
+    if demonstrations:
+        examples = [
+            "以下 Few-shot 示例来自 development 集，每条只包含自然语言问题和 SQL，不附示例 Schema。"
+            "请学习问题到 SQL 的映射；目标 SQL 必须依据本题目标 Schema 编写，"
+            "不要照搬示例里的表名、字段名或具体字面值。"
+        ]
+        for number, record in enumerate(demonstrations, start=1):
+            examples.append(
+                f"示例 {number}\n"
+                f"问题：{record.get('question', '')}\n"
+                f"SQL：{record.get('_gold_sql', '')}"
+            )
+        prompt_sections.append("\n\n".join(examples))
+    target_context = f"Database: {db_id}\n" if include_target_schema else ""
+    schema_context = f"Schema:\n{compact_schema_prompt(db_id)}\n\n" if include_target_schema else ""
+    prompt_sections.append(
+        f"{target_context}SQL dialect: SQLite\n"
+        f"{schema_context}Question:\n{question}\n\n"
         "Return one SQLite SELECT query only."
     )
+    user_prompt = "\n\n".join(prompt_sections)
     return BASELINE_SYSTEM_PROMPT, user_prompt
+
+
+COMPLEX_QUERY_CUES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("聚合或分组", ("平均", "总计", "总和", "总共", "一共有", "总数", "数量", "多少", "几个", "几位", "每个", "每种", "每年", "分别", "average", "total", "sum", "count", "how many", "number of", "per ", "each ", "group by")),
+    ("比较或排名", ("最高", "最低", "最大", "最小", "最多", "最少", "排名", "前几", "第几", "大于", "小于", "超过", "至少", "至多", "之间", "highest", "lowest", "most", "least", "top ", "rank", "more than", "less than", "at least", "at most", "between")),
+    ("多条件组合", ("并且", "同时", "以及", "或者", "且", "和", "与", "both ", "either ", " and ", " or ")),
+    ("嵌套或排除", ("除了", "不包括", "不包含", "没有任何", "至少一个", "all of", "none of", "without", "except", "not any")),
+)
+
+
+def complex_query_reasons(question: str) -> list[str]:
+    normalized = f" {question.casefold()} "
+    return [
+        reason
+        for reason, cues in COMPLEX_QUERY_CUES
+        if any(cue in normalized for cue in cues)
+    ]
+
+
+def build_query_plan_prompt(user_prompt: str) -> str:
+    context = re.sub(
+        r"\s*Return one SQLite SELECT query only\.?\s*$",
+        "",
+        user_prompt,
+        flags=re.IGNORECASE,
+    ).rstrip()
+    return (
+        f"{context}\n\n"
+        "请先整理查询计划，不要生成 SQL。按 JSON 字段写清：目标字段、过滤条件、需要使用的表及连接关系、聚合/分组、排序/数量限制。"
+    )
+
+
+def normalize_query_plan(raw_plan: str) -> dict[str, Any]:
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_plan.strip(), flags=re.IGNORECASE)
+    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict) and isinstance(parsed.get("query_plan"), dict):
+                parsed = parsed["query_plan"]
+            if isinstance(parsed, dict):
+                fields: dict[str, Any] = {}
+                for key in (
+                    "target_fields",
+                    "filters",
+                    "tables_and_joins",
+                    "aggregation_grouping",
+                    "sorting_limit",
+                ):
+                    value = parsed.get(key, "")
+                    if isinstance(value, (str, list)):
+                        fields[key] = value
+                    elif value is None:
+                        fields[key] = ""
+                    else:
+                        fields[key] = str(value)
+                return fields
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return {"raw_plan": cleaned[:6_000]}
+
+
+def build_prompt_with_query_plan(user_prompt: str, query_plan: dict[str, Any]) -> str:
+    return (
+        f"{user_prompt}\n\n"
+        "查询计划（由模型整理，仅供参考；若与问题或 Schema 不一致，以问题和 Schema 为准）：\n"
+        f"{json.dumps(query_plan, ensure_ascii=False, indent=2)}\n\n"
+        "根据问题、目标 Schema 和上述计划生成 SQL；再次核对字段、过滤值、连接条件、聚合与排序，只输出一条 SQLite SELECT。"
+    )
 
 
 class FatalModelServiceError(RuntimeError):
@@ -459,7 +578,13 @@ def retry_delay(error: urllib.error.HTTPError, attempt: int) -> float:
     return float(2 ** attempt)
 
 
-def call_chat_completion(model: str, system_prompt: str, user_prompt: str) -> str:
+def call_chat_completion(
+    model: str,
+    system_prompt: str,
+    user_prompt: str,
+    *,
+    max_tokens: int | None = None,
+) -> str:
     parsed_base_url = urlsplit(API_BASE_URL)
     endpoint_path = parsed_base_url.path.rstrip("/")
     if not endpoint_path.endswith("/chat/completions"):
@@ -473,6 +598,8 @@ def call_chat_completion(model: str, system_prompt: str, user_prompt: str) -> st
         ],
         **GENERATION_PARAMS,
     }
+    if max_tokens is not None:
+        request_payload["max_tokens"] = max_tokens
     if DISABLE_THINKING:
         request_payload["chat_template_kwargs"] = {"enable_thinking": False}
     request_body = json.dumps(request_payload).encode("utf-8")
@@ -549,6 +676,21 @@ READONLY_BLOCKED_ACTIONS = {
     )
     if hasattr(sqlite3, name)
 }
+
+
+def open_fewshot_source_db(db_id: str) -> sqlite3.Connection:
+    try:
+        return open_source_db(db_id)
+    except HTTPException as error:
+        raise sqlite3.OperationalError(str(error.detail)) from error
+
+
+FEWSHOT_RETRIEVER = FewShotRetriever(
+    RECORDS.get("development", []),
+    SCHEMAS,
+    open_fewshot_source_db,
+    readonly_authorizer,
+)
 
 
 def execute_for_evaluation(db_id: str, sql: str) -> dict[str, Any]:
@@ -727,8 +869,13 @@ def mismatch_reasons(predicted_sql: str, gold_sql: str, difference: dict[str, An
     return reasons
 
 
-def evaluate_generated_sql(db_id: str, predicted_sql: str, gold_sql: str) -> tuple[str, list[dict[str, str]], dict[str, Any], dict[str, Any], dict[str, Any]]:
-    prediction = execute_for_evaluation(db_id, predicted_sql)
+def evaluate_generated_sql(
+    db_id: str,
+    predicted_sql: str,
+    gold_sql: str,
+    prediction: dict[str, Any] | None = None,
+) -> tuple[str, list[dict[str, str]], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    prediction = prediction if prediction is not None else execute_for_evaluation(db_id, predicted_sql)
     if not prediction.get("ok"):
         title = "生成 SQL 超时" if prediction.get("timed_out") else "生成 SQL 超过结果行数上限" if prediction.get("too_many_rows") else "生成 SQL 无法执行"
         if prediction.get("category") in {"sql_error", "readonly"}:
@@ -761,6 +908,99 @@ def evaluate_generated_sql(db_id: str, predicted_sql: str, gold_sql: str) -> tup
         row_match = {"generated_only": json_value(generated_only[0]) if generated_only else None, "gold_only": json_value(gold_only[0]) if gold_only else None}
     difference = {"ordered": ordered, "predicted_row_count": len(predicted_rows), "gold_row_count": len(gold_rows), "row_match": row_match}
     return "incorrect", mismatch_reasons(predicted_sql, gold_sql, difference), result_summary(prediction), result_summary(reference), difference
+
+
+def score_generated_sql(
+    model: str,
+    db_id: str,
+    question: str,
+    sql: str,
+    execution: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    execution = execution if execution is not None else execute_for_evaluation(db_id, sql)
+    checks = validation_checks(execution)
+    validation = {
+        "checks": checks,
+        "execution": result_summary(execution),
+    }
+    if deterministic_hard_failure(execution):
+        error = str(execution.get("error", "SQL 未通过确定性检查"))
+        return (
+            {
+                "score": 0,
+                "dimensions": {
+                    "intent_alignment": 0,
+                    "schema_grounding": 0,
+                    "query_logic": 0,
+                    "output_constraints": 0,
+                },
+                "issues": [error[:400]],
+                "feedback": f"先修复 SQLite 校验错误：{error[:800]}",
+                "score_source": "deterministic",
+                "validation": validation,
+            },
+            execution,
+        )
+
+    started = time.monotonic()
+    try:
+        raw_score = call_chat_completion(
+            model,
+            QUALITY_RUBRIC_SYSTEM_PROMPT,
+            score_quality_prompt(
+                db_id=db_id,
+                question=question,
+                schema=compact_schema_prompt(db_id),
+                sql=sql,
+                execution=execution,
+            ),
+            max_tokens=700,
+        )
+        score = parse_quality_response(raw_score)
+        score.update(
+            {
+                "score_source": "llm_rubric",
+                "validation": validation,
+                "grader_latency_ms": round((time.monotonic() - started) * 1000, 2),
+            }
+        )
+        return score, execution
+    except Exception as error:
+        return (
+            {
+                "score": None,
+                "dimensions": {},
+                "issues": [],
+                "feedback": "",
+                "score_source": "llm_rubric",
+                "validation": validation,
+                "grader_error": f"{type(error).__name__}: {str(error)[:800]}",
+                "grader_latency_ms": round((time.monotonic() - started) * 1000, 2),
+            },
+            execution,
+        )
+
+
+def build_quality_retry_prompt(
+    original_prompt: str,
+    previous_sql: str,
+    assessment: dict[str, Any],
+    attempt_number: int,
+) -> str:
+    feedback = str(assessment.get("feedback", "")).strip()
+    issues = assessment.get("issues", [])
+    if issues:
+        feedback = (feedback + "\n" if feedback else "") + "\n".join(f"- {issue}" for issue in issues)
+    if assessment.get("grader_error"):
+        feedback = f"评分服务异常，无法提供语义反馈：{assessment['grader_error']}"
+    if not feedback:
+        feedback = "SQL 质量分低于通过阈值，请重新检查问题语义、schema、关联条件、筛选与聚合逻辑。"
+    return (
+        f"{original_prompt}\n\n"
+        f"上一版 SQL（第 {attempt_number - 1} 次尝试）：\n{previous_sql}\n\n"
+        f"质量反馈（评分 {assessment.get('score', '未知')}/100）：\n{feedback}\n\n"
+        "请根据反馈修订 SQL。仍然只输出一条 SQLite 只读 SELECT 查询，不要附解释或 Markdown。"
+    )
 
 
 app = FastAPI(title="CSpider NL2SQL Workbench API", version="1.0.0")
@@ -866,6 +1106,15 @@ def experiment_summary(run_id: str, include_prompt: bool = False) -> dict[str, A
             "SELECT item_status, COUNT(*) AS count FROM experiment_items WHERE run_id = ? GROUP BY item_status",
             (run_id,),
         ).fetchall()
+        parameters = parse_json(run["parameters_json"], GENERATION_PARAMS)
+        quality_rows = (
+            connection.execute(
+                "SELECT evaluation_status, quality_assessment_json FROM experiment_items WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+            if parameters.get("quality_scoring")
+            else []
+        )
     status_counts = {row["evaluation_status"]: row["count"] for row in counts}
     item_state_counts = {row["item_status"]: row["count"] for row in item_states}
     correct = status_counts.get("correct", 0)
@@ -876,7 +1125,7 @@ def experiment_summary(run_id: str, include_prompt: bool = False) -> dict[str, A
         "split": run["split"],
         "model": run["model"],
         "prompt_version": run["prompt_version"],
-        "parameters": parse_json(run["parameters_json"], GENERATION_PARAMS),
+        "parameters": parameters,
         "sample_limit": run["sample_limit"],
         "full_dataset": run["total_count"] == len(RECORDS.get(run["split"], [])),
         "sample_seed": run["sample_seed"],
@@ -900,6 +1149,16 @@ def experiment_summary(run_id: str, include_prompt: bool = False) -> dict[str, A
         },
         "accuracy": round(correct / evaluated, 4) if evaluated else None,
     }
+    if parameters.get("quality_scoring"):
+        payload["quality_summary"] = quality_discrimination_summary(
+            [
+                {
+                    "evaluation_status": row["evaluation_status"],
+                    "assessment": parse_json(row["quality_assessment_json"], {}),
+                }
+                for row in quality_rows
+            ]
+        )
     if include_prompt:
         payload["system_prompt"] = run["system_prompt"]
     return payload
@@ -918,6 +1177,8 @@ def update_experiment_item(
     prediction_summary: dict[str, Any] | None = None,
     gold_summary: dict[str, Any] | None = None,
     diff: dict[str, Any] | None = None,
+    quality_assessment: dict[str, Any] | None = None,
+    prompt: str | None = None,
 ) -> None:
     completed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     with state_connection() as connection:
@@ -925,8 +1186,8 @@ def update_experiment_item(
             """
             UPDATE experiment_items
             SET item_status = ?, evaluation_status = ?, generated_sql = ?, model = ?, latency_ms = ?,
-                generation_error = ?, diagnosis_json = ?, prediction_summary_json = ?, gold_summary_json = ?,
-                diff_json = ?, completed_at = ?
+                generation_error = ?, prompt = COALESCE(?, prompt), diagnosis_json = ?, prediction_summary_json = ?, gold_summary_json = ?,
+                diff_json = ?, quality_assessment_json = ?, completed_at = ?
             WHERE id = ?
             """,
             (
@@ -936,68 +1197,441 @@ def update_experiment_item(
                 model,
                 latency_ms,
                 generation_error,
+                prompt,
                 json.dumps(diagnosis or [], ensure_ascii=False),
                 json.dumps(prediction_summary or {}, ensure_ascii=False),
                 json.dumps(gold_summary or {}, ensure_ascii=False),
                 json.dumps(diff or {}, ensure_ascii=False),
+                json.dumps(quality_assessment or {}, ensure_ascii=False),
                 completed_at,
                 item_id,
             ),
         )
 
 
-def generate_and_evaluate_experiment_item(run: sqlite3.Row, item: sqlite3.Row) -> dict[str, Any]:
+class SQLReviewGraphState(TypedDict, total=False):
+    run: Any
+    item: Any
+    model: str
+    system_prompt: str
+    user_prompt: str
+    generation_prompt: str
+    current_prompt: str
+    db_id: str
+    question: str
+    gold_sql: str
+    quality_enabled: bool
+    query_planning_enabled: bool
+    query_plan: dict[str, Any]
+    retry_limit: int
+    attempt_limit: int
+    score_threshold: int
+    judge_model: str
+    attempt_number: int
+    candidate_sql: str
+    execution: dict[str, Any]
+    assessment: dict[str, Any]
+    candidates: list[dict[str, Any]]
+    quality_attempts: list[dict[str, Any]]
+    retry_generation_errors: list[str]
+    generation_time_ms: float
+    grader_time_ms: float
+    started_at: float
+    generation_error: str
+    fatal: bool
+    result: dict[str, Any]
+
+
+def _sql_review_route_start(state: SQLReviewGraphState) -> str:
+    query_plan = state.get("query_plan", {})
+    return "plan" if state.get("query_planning_enabled") and query_plan.get("triggered") else "generate"
+
+
+def _sql_review_plan(state: SQLReviewGraphState) -> dict[str, Any]:
     started = time.monotonic()
+    try:
+        raw_plan = call_chat_completion(
+            state["model"],
+            QUERY_PLAN_SYSTEM_PROMPT,
+            build_query_plan_prompt(state["user_prompt"]),
+            max_tokens=700,
+        )
+        plan = normalize_query_plan(raw_plan)
+        elapsed_ms = round((time.monotonic() - started) * 1000, 2)
+        query_plan = {
+            **state.get("query_plan", {}),
+            "status": "generated_unstructured" if "raw_plan" in plan else "generated",
+            "plan": plan,
+            "latency_ms": elapsed_ms,
+            "planner_prompt": {
+                "system": QUERY_PLAN_SYSTEM_PROMPT,
+                "user": build_query_plan_prompt(state["user_prompt"]),
+            },
+        }
+        generation_prompt = build_prompt_with_query_plan(state["user_prompt"], plan)
+        return {
+            "query_plan": query_plan,
+            "generation_prompt": generation_prompt,
+            "current_prompt": generation_prompt,
+            "generation_time_ms": state.get("generation_time_ms", 0.0) + elapsed_ms,
+        }
+    except Exception as error:
+        elapsed_ms = round((time.monotonic() - started) * 1000, 2)
+        query_plan = {
+            **state.get("query_plan", {}),
+            "status": "failed_fallback",
+            "error": f"{type(error).__name__}: {str(error)[:800]}",
+            "latency_ms": elapsed_ms,
+            "planner_prompt": {
+                "system": QUERY_PLAN_SYSTEM_PROMPT,
+                "user": build_query_plan_prompt(state["user_prompt"]),
+            },
+        }
+        return {
+            "query_plan": query_plan,
+            "generation_prompt": state["user_prompt"],
+            "current_prompt": state["user_prompt"],
+            "generation_time_ms": state.get("generation_time_ms", 0.0) + elapsed_ms,
+        }
+
+
+def _sql_review_generate(state: SQLReviewGraphState) -> dict[str, Any]:
+    started = time.monotonic()
+    try:
+        candidate_sql = call_chat_completion(
+            state["model"], state["system_prompt"], state["current_prompt"]
+        )
+    except Exception as error:
+        message = f"{type(error).__name__}: {str(error)}"[:1200]
+        updates: dict[str, Any] = {
+            "generation_error": message,
+            "fatal": isinstance(error, FatalModelServiceError),
+        }
+        if state.get("candidates"):
+            updates["retry_generation_errors"] = [
+                *state.get("retry_generation_errors", []), message
+            ]
+            updates["fatal"] = False
+        return updates
+    return {
+        "candidate_sql": candidate_sql,
+        "generation_error": "",
+        "generation_time_ms": state.get("generation_time_ms", 0.0)
+        + (time.monotonic() - started) * 1000,
+    }
+
+
+def _sql_review_validate(state: SQLReviewGraphState) -> dict[str, Any]:
+    return {"execution": execute_for_evaluation(state["db_id"], state["candidate_sql"])}
+
+
+def _sql_review_score(state: SQLReviewGraphState) -> dict[str, Any]:
+    candidate_sql = state["candidate_sql"]
+    execution = state["execution"]
+    assessment: dict[str, Any] = {}
+    quality_attempts = list(state.get("quality_attempts", []))
+    grader_time_ms = state.get("grader_time_ms", 0.0)
+    if state["quality_enabled"]:
+        grader_started = time.monotonic()
+        assessment, execution = score_generated_sql(
+            state["judge_model"],
+            state["db_id"],
+            state["question"],
+            candidate_sql,
+            execution=execution,
+        )
+        grader_time_ms += float(assessment.get("grader_latency_ms", 0) or 0)
+        assessment["attempt"] = state["attempt_number"]
+        assessment["sql"] = candidate_sql
+        assessment["grading_wall_time_ms"] = round(
+            (time.monotonic() - grader_started) * 1000, 2
+        )
+        quality_attempts.append(assessment)
+
+    candidate = {
+        "sql": candidate_sql,
+        "execution": execution,
+        "assessment": assessment,
+        "attempt_number": state["attempt_number"],
+    }
+    return {
+        "execution": execution,
+        "assessment": assessment,
+        "candidates": [*state.get("candidates", []), candidate],
+        "quality_attempts": quality_attempts,
+        "grader_time_ms": grader_time_ms,
+    }
+
+
+def _sql_review_after_generate(state: SQLReviewGraphState) -> str:
+    return "finalize" if state.get("generation_error") else "validate"
+
+
+def _sql_review_after_score(state: SQLReviewGraphState) -> str:
+    if not state["quality_enabled"]:
+        return "finalize"
+    assessment = state.get("assessment", {})
+    score = assessment.get("score")
+    if (
+        score is None
+        or score >= state["score_threshold"]
+        or state["attempt_number"] >= state["attempt_limit"]
+    ):
+        return "finalize"
+    return "prepare_retry"
+
+
+def _sql_review_prepare_retry(state: SQLReviewGraphState) -> dict[str, Any]:
+    candidate = state["candidates"][-1]
+    next_attempt = state["attempt_number"] + 1
+    return {
+        "current_prompt": build_quality_retry_prompt(
+            state.get("generation_prompt", state["user_prompt"]),
+            candidate["sql"],
+            candidate["assessment"],
+            next_attempt,
+        ),
+        "attempt_number": next_attempt,
+        "assessment": {},
+        "candidate_sql": "",
+        "generation_error": "",
+    }
+
+
+def _sql_review_finalize(state: SQLReviewGraphState) -> dict[str, Any]:
+    total_started = state["started_at"]
+    candidates = list(state.get("candidates", []))
+    if not candidates:
+        message = state.get("generation_error") or "模型没有生成候选 SQL"
+        return {
+            "result": {
+                "item_status": "generation_failed",
+                "evaluation_status": "generation_failed",
+                "generated_sql": "",
+                "latency_ms": round((time.monotonic() - total_started) * 1000, 2),
+                "generation_error": message,
+                "diagnosis": [
+                    {"category": "generation", "title": "模型生成失败", "evidence": message}
+                ],
+                "quality_assessment": {},
+                "query_plan": state.get("query_plan", {}),
+                "generation_prompt": state.get("generation_prompt", state["user_prompt"]),
+                "fatal": state.get("fatal", False),
+            }
+        }
+
+    def candidate_key(candidate: dict[str, Any]) -> tuple[int, int]:
+        execution_result = candidate["execution"]
+        if execution_result.get("ok"):
+            validity_rank = 2
+        elif deterministic_hard_failure(execution_result):
+            validity_rank = 0
+        else:
+            validity_rank = 1
+        raw_score = candidate["assessment"].get("score")
+        score_rank = int(raw_score) if isinstance(raw_score, (int, float)) else -1
+        return validity_rank, score_rank
+
+    selected = max(candidates, key=candidate_key)
+    quality_assessment: dict[str, Any] = {}
+    retry_generation_errors = state.get("retry_generation_errors", [])
+    if state["quality_enabled"]:
+        for candidate in candidates:
+            benchmark_result = evaluate_generated_sql(
+                state["db_id"],
+                candidate["sql"],
+                state["gold_sql"],
+                prediction=candidate["execution"],
+            )
+            candidate["benchmark_result"] = benchmark_result
+            candidate["assessment"]["benchmark_status"] = benchmark_result[0]
+        selected_index = candidates.index(selected)
+        quality_attempts = state.get("quality_attempts", [])
+        quality_assessment = {
+            "enabled": True,
+            "rubric_version": QUALITY_RUBRIC_VERSION,
+            "threshold": state["score_threshold"],
+            "retry_limit": state["retry_limit"],
+            "retries_used": max(0, len(candidates) - 1 + len(retry_generation_errors)),
+            "judge_model": state["judge_model"],
+            "selected_attempt": selected_index + 1,
+            "score": selected["assessment"].get("score"),
+            "score_source": selected["assessment"].get("score_source", "unknown"),
+            "initial_score": quality_attempts[0].get("score") if quality_attempts else None,
+            "initial_score_source": quality_attempts[0].get("score_source", "unknown")
+            if quality_attempts
+            else "unknown",
+            "grader_latency_ms": round(state.get("grader_time_ms", 0.0), 2),
+            "attempts": quality_attempts,
+            "retry_generation_errors": retry_generation_errors,
+        }
+
+    generated_sql = selected["sql"]
+    try:
+        if state["quality_enabled"]:
+            evaluation_status, diagnosis, prediction, reference, diff = selected[
+                "benchmark_result"
+            ]
+        else:
+            evaluation_status, diagnosis, prediction, reference, diff = evaluate_generated_sql(
+                state["db_id"],
+                generated_sql,
+                state["gold_sql"],
+                prediction=selected["execution"],
+            )
+    except Exception as error:
+        message = f"评测过程出错：{str(error)[:600]}"
+        evaluation_status = "unjudged"
+        diagnosis = [
+            {"category": "evaluation", "title": "评测过程异常，需人工确认", "evidence": message}
+        ]
+        prediction, reference, diff = {}, {}, {"error": message}
+
+    return {
+        "result": {
+            "item_status": "completed",
+            "evaluation_status": evaluation_status,
+            "generated_sql": generated_sql,
+            "latency_ms": round(state.get("generation_time_ms", 0.0), 2),
+            "generation_error": "",
+            "diagnosis": diagnosis,
+            "prediction_summary": prediction,
+            "gold_summary": reference,
+            "diff": diff,
+            "quality_assessment": quality_assessment,
+            "query_plan": state.get("query_plan", {}),
+            "generation_prompt": state.get("generation_prompt", state["user_prompt"]),
+            "fatal": False,
+        }
+    }
+
+
+@lru_cache(maxsize=1)
+def get_sql_review_graph():
+    graph = StateGraph(SQLReviewGraphState)
+    graph.add_node("plan", _sql_review_plan)
+    graph.add_node("generate", _sql_review_generate)
+    graph.add_node("validate", _sql_review_validate)
+    graph.add_node("score", _sql_review_score)
+    graph.add_node("prepare_retry", _sql_review_prepare_retry)
+    graph.add_node("finalize", _sql_review_finalize)
+    graph.add_conditional_edges(
+        START,
+        _sql_review_route_start,
+        {"plan": "plan", "generate": "generate"},
+    )
+    graph.add_edge("plan", "generate")
+    graph.add_conditional_edges(
+        "generate",
+        _sql_review_after_generate,
+        {"validate": "validate", "finalize": "finalize"},
+    )
+    graph.add_edge("validate", "score")
+    graph.add_conditional_edges(
+        "score",
+        _sql_review_after_score,
+        {"prepare_retry": "prepare_retry", "finalize": "finalize"},
+    )
+    graph.add_edge("prepare_retry", "generate")
+    graph.add_edge("finalize", END)
+    return graph.compile()
+
+
+def generate_and_evaluate_experiment_item(run: sqlite3.Row, item: sqlite3.Row) -> dict[str, Any]:
+    total_started = time.monotonic()
     try:
         prompt_payload = parse_json(item["prompt"], {})
         messages = prompt_payload.get("messages", [])
-        system_prompt = next((message.get("content", "") for message in messages if message.get("role") == "system"), run["system_prompt"])
-        user_prompt = next((message.get("content", "") for message in messages if message.get("role") == "user"), "")
-        generated_sql = call_chat_completion(run["model"], system_prompt, user_prompt)
+        system_prompt = next(
+            (message.get("content", "") for message in messages if message.get("role") == "system"),
+            run["system_prompt"],
+        )
+        user_prompt = next(
+            (message.get("content", "") for message in messages if message.get("role") == "user"),
+            "",
+        )
     except Exception as error:
         message = f"{type(error).__name__}: {str(error)}"[:1200]
         return {
             "item_status": "generation_failed",
             "evaluation_status": "generation_failed",
             "generated_sql": "",
-            "latency_ms": round((time.monotonic() - started) * 1000, 2),
+            "latency_ms": round((time.monotonic() - total_started) * 1000, 2),
             "generation_error": message,
             "diagnosis": [{"category": "generation", "title": "模型生成失败", "evidence": message}],
+            "quality_assessment": {},
             "fatal": isinstance(error, FatalModelServiceError),
         }
 
-    latency_ms = round((time.monotonic() - started) * 1000, 2)
-    try:
-        evaluation_status, diagnosis, prediction, reference, diff = evaluate_generated_sql(
-            item["db_id"], generated_sql, item["gold_sql"]
-        )
-    except Exception as error:
-        message = f"评测过程出错：{str(error)[:600]}"
-        evaluation_status = "unjudged"
-        diagnosis = [{"category": "evaluation", "title": "评测过程异常，需人工确认", "evidence": message}]
-        prediction, reference, diff = {}, {}, {"error": message}
-    return {
-        "item_status": "completed",
-        "evaluation_status": evaluation_status,
-        "generated_sql": generated_sql,
-        "latency_ms": latency_ms,
-        "generation_error": "",
-        "diagnosis": diagnosis,
-        "prediction_summary": prediction,
-        "gold_summary": reference,
-        "diff": diff,
-        "fatal": False,
+    parameters = parse_json(run["parameters_json"], {})
+    quality_enabled = bool(parameters.get("quality_scoring"))
+    query_planning_enabled = bool(parameters.get("query_planning"))
+    query_plan_reasons = complex_query_reasons(item["question"])
+    query_plan = {
+        "enabled": query_planning_enabled,
+        "triggered": query_planning_enabled and bool(query_plan_reasons),
+        "status": "pending"
+        if query_planning_enabled and query_plan_reasons
+        else "not_complex"
+        if query_planning_enabled
+        else "disabled",
+        "trigger_reasons": query_plan_reasons,
     }
-
+    retry_limit = int(parameters.get("quality_retry_limit", 1)) if quality_enabled else 0
+    score_threshold = int(parameters.get("quality_score_threshold", 70))
+    judge_model = str(parameters.get("quality_judge_model", "")).strip() or run["model"]
+    state = get_sql_review_graph().invoke(
+        {
+            "run": run,
+            "item": item,
+            "model": run["model"],
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "generation_prompt": user_prompt,
+            "current_prompt": user_prompt,
+            "db_id": item["db_id"],
+            "question": item["question"],
+            "gold_sql": item["gold_sql"],
+            "quality_enabled": quality_enabled,
+            "query_planning_enabled": query_planning_enabled,
+            "query_plan": query_plan,
+            "retry_limit": retry_limit,
+            "attempt_limit": retry_limit + 1 if quality_enabled else 1,
+            "score_threshold": score_threshold,
+            "judge_model": judge_model,
+            "attempt_number": 1,
+            "candidates": [],
+            "quality_attempts": [],
+            "retry_generation_errors": [],
+            "generation_time_ms": 0.0,
+            "grader_time_ms": 0.0,
+            "started_at": total_started,
+            "fatal": False,
+        }
+    )
+    return state["result"]
 
 def persist_experiment_item_result(
     run_id: str, run: sqlite3.Row, item: sqlite3.Row, result: dict[str, Any]
 ) -> str | None:
+    prompt_payload = parse_json(item["prompt"], {})
+    if not isinstance(prompt_payload, dict):
+        prompt_payload = {}
+    messages = prompt_payload.get("messages", [])
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict) and message.get("role") == "user":
+                message["content"] = result.get("generation_prompt", message.get("content", ""))
+                break
+    prompt_payload["query_plan"] = result.get("query_plan", {})
+    prompt_snapshot = json.dumps(prompt_payload, ensure_ascii=False)
     if result["item_status"] == "generation_failed":
         update_experiment_item(
             item["id"], item_status="generation_failed", evaluation_status="generation_failed",
             model=run["model"], latency_ms=result["latency_ms"],
             generation_error=result["generation_error"], diagnosis=result["diagnosis"],
+            quality_assessment=result.get("quality_assessment", {}),
+            prompt=prompt_snapshot,
         )
         return None
 
@@ -1019,18 +1653,19 @@ def persist_experiment_item_result(
                 """,
                 (
                     item["split"], item["sample_index"], item["sample_fingerprint"], item["db_id"],
-                    item["question"], generated_sql, run["model"], run_id, latency_ms, item["prompt"], created_at,
+                    item["question"], generated_sql, run["model"], run_id, latency_ms, prompt_snapshot, created_at,
                 ),
             )
             update_cursor = connection.execute(
                 """
                 UPDATE experiment_items
-                SET item_status = 'completed', evaluation_status = ?, generated_sql = ?, model = ?, latency_ms = ?,
+                SET prompt = ?, item_status = 'completed', evaluation_status = ?, generated_sql = ?, model = ?, latency_ms = ?,
                     generation_error = '', diagnosis_json = ?, prediction_summary_json = ?, gold_summary_json = ?,
-                    diff_json = ?, completed_at = ?
+                    diff_json = ?, quality_assessment_json = ?, completed_at = ?
                 WHERE id = ? AND item_status = 'generating'
                 """,
                 (
+                    prompt_snapshot,
                     evaluation_status,
                     generated_sql,
                     run["model"],
@@ -1039,6 +1674,7 @@ def persist_experiment_item_result(
                     json.dumps(prediction, ensure_ascii=False),
                     json.dumps(reference, ensure_ascii=False),
                     json.dumps(diff, ensure_ascii=False),
+                    json.dumps(result.get("quality_assessment", {}), ensure_ascii=False),
                     created_at,
                     item["id"],
                 ),
@@ -1053,6 +1689,8 @@ def persist_experiment_item_result(
             generated_sql=generated_sql, model=run["model"], latency_ms=latency_ms,
             generation_error=message, diagnosis=storage_diagnosis,
             prediction_summary=prediction, gold_summary=reference, diff=diff,
+            quality_assessment=result.get("quality_assessment", {}),
+            prompt=prompt_snapshot,
         )
         return message
     return None
@@ -1189,6 +1827,9 @@ def get_experiment_config() -> dict[str, Any]:
         "default_system_prompt": BASELINE_SYSTEM_PROMPT,
         "max_samples": MAX_EXPERIMENT_SAMPLES,
         "max_concurrency": MAX_GENERATION_CONCURRENCY,
+        "few_shot_example_count": FEWSHOT_EXAMPLE_COUNT,
+        "few_shot_source_split": "development",
+        "query_planning_version": QUERY_PLANNING_VERSION,
     }
 
 
@@ -1206,18 +1847,129 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
         raise HTTPException(status_code=503, detail=f"NL2SQL_API_BASE_URL 无效：{error}") from error
     model = body.model.strip()
     system_prompt = body.system_prompt.strip()
+    quality_judge_model = body.quality_judge_model.strip() or model
     if not model:
         raise HTTPException(status_code=422, detail="模型 ID 不能为空")
     if not system_prompt:
         raise HTTPException(status_code=422, detail="System Prompt 不能为空")
     total_samples = len(RECORDS[body.split])
+    few_shot_enabled = body.use_few_shot and body.split != "development"
+    few_shot_count = FEWSHOT_EXAMPLE_COUNT if few_shot_enabled else 0
+    target_schema_enabled = body.use_target_schema
     if body.sample_limit == 0 or body.sample_limit >= total_samples:
         sample_indices = list(range(total_samples))
     else:
         sample_indices = sorted(random.Random(body.sample_seed).sample(range(total_samples), body.sample_limit))
     run_id = f"run-{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    prompt_version = "sha256:" + hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:12]
+    prompt_fingerprint = json.dumps(
+        {
+            "system_prompt": system_prompt,
+            "few_shot_enabled": few_shot_enabled,
+            "few_shot_count": few_shot_count,
+            "few_shot_source_split": "development" if few_shot_enabled else "",
+            "few_shot_retrieval_version": FEWSHOT_RETRIEVAL_VERSION,
+            "target_schema_enabled": target_schema_enabled,
+            "query_planning": body.use_query_planning,
+            "query_planning_version": QUERY_PLANNING_VERSION if body.use_query_planning else "",
+            "quality_scoring": body.use_quality_scoring,
+            "quality_rubric_version": QUALITY_RUBRIC_VERSION if body.use_quality_scoring else "",
+            "quality_score_threshold": body.quality_score_threshold if body.use_quality_scoring else None,
+            "quality_retry_limit": body.quality_retry_limit if body.use_quality_scoring else 0,
+            "quality_judge_model": quality_judge_model if body.use_quality_scoring else "",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    prompt_version = "sha256:" + hashlib.sha256(prompt_fingerprint.encode("utf-8")).hexdigest()[:12]
+    run_parameters = {
+        **GENERATION_PARAMS,
+        "concurrency": MAX_GENERATION_CONCURRENCY,
+        "sql_review_engine": "langgraph-stategraph-v1",
+        "few_shot_requested": body.use_few_shot,
+        "few_shot_enabled": few_shot_enabled,
+        "few_shot_count": few_shot_count,
+        "few_shot_source_split": "development" if few_shot_enabled else "",
+        "few_shot_retrieval_version": FEWSHOT_RETRIEVAL_VERSION,
+        "target_schema_enabled": target_schema_enabled,
+        "query_planning": body.use_query_planning,
+        "query_planning_version": QUERY_PLANNING_VERSION if body.use_query_planning else "",
+        "quality_scoring": body.use_quality_scoring,
+        "quality_rubric_version": QUALITY_RUBRIC_VERSION if body.use_quality_scoring else "",
+        "quality_score_threshold": body.quality_score_threshold,
+        "quality_retry_limit": body.quality_retry_limit if body.use_quality_scoring else 0,
+        "quality_judge_model": quality_judge_model if body.use_quality_scoring else "",
+        "optimization_note": body.optimization_note.strip(),
+        "optimization_log": [
+            {
+                "id": "select-projection-v1",
+                "title": "精简 SELECT 字段",
+                "applied": True,
+                "detail": "提示词要求只返回回答问题所需的字段，减少额外投影列。",
+            },
+            {
+                "id": FEWSHOT_RETRIEVAL_VERSION,
+                "title": "相似示例检索（Few-shot）",
+                "applied": few_shot_enabled,
+                "detail": (
+                    f"按中文字符片段和 schema 标识符，从 development 集检索最多 {FEWSHOT_EXAMPLE_COUNT} 个示例；"
+                    "每条示例只包含问题与 SQL，不附示例 Schema；候选 SQL 需只读执行成功且返回非空、非全 NULL 结果。"
+                    if few_shot_enabled
+                    else "本轮未启用：用户关闭该选项。"
+                    if not body.use_few_shot
+                    else "本轮未启用：development 集同时作为示例来源，为避免泄漏自动关闭。"
+                ),
+            },
+            {
+                "id": "no-thinking-output-v1",
+                "title": "SQL 输出清理",
+                "applied": True,
+                "detail": (
+                    "请求关闭 thinking，并清理返回内容里的 think 标记与 Markdown 围栏。"
+                    if DISABLE_THINKING
+                    else "清理返回内容里的 think 标记与 Markdown 围栏。"
+                ),
+            },
+            {
+                "id": "target-schema-context-v1",
+                "title": "目标题 Schema 上下文",
+                "applied": target_schema_enabled,
+                "detail": (
+                    "向生成模型提供目标数据库的精简表、字段与外键关系。"
+                    if target_schema_enabled
+                    else "本轮未向生成模型提供目标数据库名、表结构或外键。评分和 SQL 校验仍使用真实数据库结构。"
+                ),
+            },
+            {
+                "id": QUERY_PLANNING_VERSION,
+                "title": "复杂问题查询计划节点",
+                "applied": body.use_query_planning,
+                "detail": (
+                    "遇到聚合/分组、比较/排名、多条件组合或嵌套/排除提示时，先生成包含目标字段、过滤、表与连接、聚合/分组、排序/数量限制的 JSON 计划，再将计划交给 SQL 生成节点；计划失败时回退直接生成。"
+                    if body.use_query_planning
+                    else "本轮未启用；可通过批次配置单独打开。"
+                ),
+            },
+            {
+                "id": "langgraph-stategraph-v1",
+                "title": "LangGraph SQL 质控流程",
+                "applied": True,
+                "detail": "用 StateGraph 编排 SQL 生成、只读检查、语义评分、条件重试与候选选择。",
+            },
+            {
+                "id": QUALITY_RUBRIC_VERSION,
+                "title": "SQL 校验与语义评分",
+                "applied": body.use_quality_scoring,
+                "detail": (
+                    f"先执行 SQLite 只读、语法、schema 校验，再由 {quality_judge_model} 按问题匹配、schema grounding、查询逻辑、输出约束四项加权评分；"
+                    f"低于 {body.quality_score_threshold} 分时最多修订 {body.quality_retry_limit} 次。"
+                    if body.use_quality_scoring
+                    else "本轮未启用。"
+                ),
+            },
+        ],
+    }
     with state_connection() as connection:
         connection.execute("BEGIN IMMEDIATE")
         active_count = int(connection.execute("SELECT COUNT(*) FROM experiment_runs WHERE status IN ('queued', 'running')").fetchone()[0])
@@ -1229,11 +1981,16 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
                 (id, split, model, system_prompt, prompt_version, parameters_json, sample_limit, sample_seed, worker_pid, worker_started_at, total_count, status, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
             """,
-            (run_id, body.split, model, system_prompt, prompt_version, json.dumps({**GENERATION_PARAMS, "concurrency": MAX_GENERATION_CONCURRENCY}), body.sample_limit, body.sample_seed, os.getpid(), psutil.Process(os.getpid()).create_time(), len(sample_indices), now, now),
+            (run_id, body.split, model, system_prompt, prompt_version, json.dumps(run_parameters), body.sample_limit, body.sample_seed, os.getpid(), psutil.Process(os.getpid()).create_time(), len(sample_indices), now, now),
         )
         for index in sample_indices:
             record = RECORDS[body.split][index]
-            _, user_prompt = build_prompt(record["db_id"], record.get("question", ""))
+            _, user_prompt = build_prompt(
+                record["db_id"],
+                record.get("question", ""),
+                few_shot_count=few_shot_count,
+                include_target_schema=target_schema_enabled,
+            )
             prompt_snapshot = json.dumps(
                 {"messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]},
                 ensure_ascii=False,
@@ -1257,6 +2014,106 @@ def get_experiments(limit: int = Query(30, ge=1, le=100)) -> dict[str, Any]:
         runs = connection.execute("SELECT id FROM experiment_runs ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
     items = [summary for row in runs if (summary := experiment_summary(row["id"])) is not None]
     return {"items": items}
+
+
+@app.get("/api/experiment-analytics/full-test-problem-categories")
+def get_full_test_problem_categories(
+    split: str = Query("test", pattern="^(test|validation)$"),
+    run_a_id: str = Query("", max_length=100),
+    run_b_id: str = Query("", max_length=100),
+) -> dict[str, Any]:
+    recover_interrupted_experiments()
+    full_dataset_count = len(RECORDS.get(split, []))
+    with state_connection() as connection:
+        available_rows = connection.execute(
+            """
+            SELECT id, model, prompt_version, created_at, total_count
+            FROM experiment_runs
+            WHERE split = ? AND status = 'completed' AND total_count = ?
+            ORDER BY created_at DESC
+            """,
+            (split, full_dataset_count),
+        ).fetchall()
+
+        available_runs = [{"run_id": row["id"], **dict(row)} for row in available_rows]
+        available_by_id = {run["run_id"]: run for run in available_runs}
+        selected_a = available_by_id.get(run_a_id) or (available_runs[0] if available_runs else None)
+        selected_b = available_by_id.get(run_b_id) if run_b_id != (selected_a or {}).get("id") else None
+        if selected_b is None:
+            selected_b = next(
+                (run for run in available_runs if run["id"] != (selected_a or {}).get("id")),
+                None,
+            )
+        runs = [run for run in (selected_a, selected_b) if run is not None]
+
+        category_counts: defaultdict[str, dict[str, Any]] = defaultdict(
+            lambda: {
+                "title": "",
+                "incorrect": [set(), set()],
+                "unjudged": [set(), set()],
+                "generation_failed": [set(), set()],
+            }
+        )
+        for run_index, run in enumerate(runs):
+            rows = connection.execute(
+                """
+                SELECT sample_index, evaluation_status, diagnosis_json
+                FROM experiment_items
+                WHERE run_id = ? AND evaluation_status IN ('incorrect', 'unjudged', 'generation_failed')
+                """,
+                (run["id"],),
+            ).fetchall()
+            for row in rows:
+                status = str(row["evaluation_status"])
+                diagnoses = parse_json(row["diagnosis_json"], [])
+                if not isinstance(diagnoses, list):
+                    diagnoses = []
+                seen_categories: set[str] = set()
+                for diagnosis in diagnoses:
+                    if not isinstance(diagnosis, dict):
+                        continue
+                    category = str(diagnosis.get("category", "unknown"))
+                    if category in {"match", "evaluation_evidence"} or category in seen_categories:
+                        continue
+                    seen_categories.add(category)
+                    counts = category_counts[category]
+                    counts["title"] = counts["title"] or str(diagnosis.get("title", category))
+                    counts[status][run_index].add(int(row["sample_index"]))
+                if status == "generation_failed" and not seen_categories:
+                    category_counts["generation_failed"]["title"] = "模型生成失败"
+                    category_counts["generation_failed"]["generation_failed"][run_index].add(int(row["sample_index"]))
+
+    run_summaries = [experiment_summary(run["id"]) for run in runs]
+    categories = []
+    for category, counts in category_counts.items():
+        per_run = []
+        for run_index in range(len(runs)):
+            incorrect = len(counts["incorrect"][run_index])
+            unjudged = len(counts["unjudged"][run_index])
+            generation_failed = len(counts["generation_failed"][run_index])
+            per_run.append({
+                "incorrect": incorrect,
+                "unjudged": unjudged,
+                "generation_failed": generation_failed,
+                "total": incorrect + unjudged + generation_failed,
+            })
+        run_a_count = per_run[0]["total"] if per_run else 0
+        run_b_count = per_run[1]["total"] if len(per_run) > 1 else 0
+        categories.append({
+            "category": category,
+            "title": counts["title"] or category,
+            "runs": per_run,
+            "delta": run_a_count - run_b_count,
+        })
+    categories.sort(key=lambda item: (-max((run["total"] for run in item["runs"]), default=0), item["title"]))
+    return {
+        "split": split,
+        "available_runs": available_runs,
+        "selected_run_ids": [run["id"] for run in runs],
+        "runs": [summary for summary in run_summaries if summary is not None],
+        "categories": categories,
+        "category_method": "每个诊断类别按受影响样本数计数；同一样本可以属于多个问题类别；执行差异证据不作为问题类别重复统计。",
+    }
 
 
 @app.get("/api/experiments/{run_id}")
@@ -1298,7 +2155,7 @@ def get_experiment_items(
     with state_connection() as connection:
         total = int(connection.execute(f"SELECT COUNT(*) FROM experiment_items WHERE {where}", values).fetchone()[0])
         rows = connection.execute(
-            f"SELECT id, sample_index, db_id, question, generated_sql, item_status, evaluation_status, generation_error, diagnosis_json, latency_ms, completed_at FROM experiment_items WHERE {where} ORDER BY sample_index LIMIT ? OFFSET ?",
+            f"SELECT id, sample_index, db_id, question, generated_sql, item_status, evaluation_status, generation_error, diagnosis_json, quality_assessment_json, latency_ms, completed_at FROM experiment_items WHERE {where} ORDER BY sample_index LIMIT ? OFFSET ?",
             [*values, page_size, (page - 1) * page_size],
         ).fetchall()
     items = []
@@ -1315,6 +2172,7 @@ def get_experiment_items(
             "generation_error": row["generation_error"],
             "diagnosis": diagnosis,
             "reason_title": diagnosis[0].get("title", "") if diagnosis else "",
+            "quality_score": parse_json(row["quality_assessment_json"], {}).get("score"),
             "latency_ms": row["latency_ms"],
             "completed_at": row["completed_at"],
         })
@@ -1347,6 +2205,7 @@ def get_experiment_item(run_id: str, item_id: int) -> dict[str, Any]:
         "prediction_summary": parse_json(row["prediction_summary_json"], {}),
         "gold_summary": parse_json(row["gold_summary_json"], {}),
         "diff": parse_json(row["diff_json"], {}),
+        "quality_assessment": parse_json(row["quality_assessment_json"], {}),
         "completed_at": row["completed_at"],
     }
 

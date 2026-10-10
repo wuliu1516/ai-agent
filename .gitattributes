@@ -1,3 +1,4 @@
 # sh 无法解析 CRLF；Makefile 与 shell 脚本固定为 LF。
 Makefile text eol=lf
 *.sh     text eol=lf
+backend/storage/workbench.sqlite3 filter=lfs diff=lfs merge=lfs -text

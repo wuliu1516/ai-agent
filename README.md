@@ -43,6 +43,10 @@ Makefile 的配方中不要直接写中文：Windows 版 make 会按系统码页
 - 每条样本显示所属数据库、金标 SQL、生成 SQL 编辑/保存框，以及生成历史。
 - 数据库浏览器展示表、字段类型、主键/外键和分页数据预览。
 - 批量运行审阅页可启动固定模型的基线实验，查看正确、错误、无法判定及生成失败样本。
+- 验证集和测试集批量运行可启用 Few-shot：按问题字符 n-gram 与 schema 标识符从 development 集检索最多 2 个示例；提示词只附示例问题和 SQL，不附示例 Schema，并过滤无法执行或仅返回空/NULL 结果的示例；development 集运行会自动关闭 Few-shot，避免样本泄漏。检索与示例 schema 提取位于 `backend/fewshot.py`，FastAPI 路由与工作台逻辑位于 `backend/main.py`。
+- 批量运行可启用 SQL 质量评分：先用 SQLite 只读执行检查约束、语法、schema 和可执行性；硬错误计为 0 分并把错误反馈给生成模型。通过硬检查的 SQL 再由 rubric 对问题匹配、schema grounding、查询逻辑、输出约束打分；低于阈值时可带反馈修订，最多 2 次。评分细节与修订前后 SQL 会随样本保存。
+- 批量运行可选启用复杂问题查询计划：问题命中聚合/分组、比较/排名、多条件或嵌套/排除规则时，LangGraph 先调用模型生成结构化计划，再交给 SQL 生成节点；未命中时直接生成，计划调用失败时回退直接生成。每条样本展示触发原因、计划、计划 Prompt 和实际 SQL Prompt。
+- 质量评分汇总使用首次 Rubric 分数与最终执行对错计算 AUC，确定性拦截项不混进 Rubric AUC；同时展示修订后由错转对、由对转错的数量。测试集上的 AUC 只作诊断，不代表新数据上的泛化效果。
 - 逐条展开后展示自然语言问题、金标 SQL、本轮实际 Prompt、生成 SQL、初步原因、执行证据和结果预览。
 - 已保存的生成记录可通过样本详情和 `GET /api/results` 查看。
 - 原始 CSpider JSON 与各数据库 SQLite 文件不被修改。NL2SQL 生成记录单独写入 `backend/storage/workbench.sqlite3`；可用 `NL2SQL_STATE_DB` 指定保存位置。
@@ -97,6 +101,10 @@ NL2SQL_DISABLE_THINKING=true
 `NL2SQL_API_BASE_URL` 是 API 前缀，后端会在末尾追加 `/chat/completions`。批量运行页面允许填写本轮使用的模型和 system prompt；模型默认值来自 `NL2SQL_MODEL`。每条样本的结果可查看本次实际使用的 Prompt、自然语言问题、金标 SQL、生成 SQL 和初步原因，供逐条审阅。
 
 `NL2SQL_DISABLE_THINKING=true` 会在请求中发送 `chat_template_kwargs.enable_thinking=false`，适用于支持该参数的 Qwen3/vLLM 服务。后端也会移除响应中 `</think>` 之前的推理文本，确保评测器只收到最终 SQL。
+
+单条 SQL 的计划生成（可选）、SQL 生成、只读校验、Rubric 评分与条件重试由 LangGraph `StateGraph` 编排；FastAPI 批次管理、SQLite 结果保存和页面展示仍在本地工作台中。开发依赖固定了 LangGraph 1.2.14；使用 `make setup-deps` 更新依赖。
+
+批量运行页面默认启用 Rubric 评分与低分修订，初始阈值为 70 分、最多修订 1 次；可以关闭评分，或将修订次数设为 0–2。评分模型留空时与生成模型相同。AUC 根据第一版 SQL 的 Rubric 分数与执行对错计算，0.5 接近随机排序，1.0 表示排序区分较好；需要同时查看两类样本数，少量样本的 AUC 波动较大。
 
 批量运行默认最多处理所选数据划分中的 20 条样本；将数量设为 `0` 表示运行该划分的全部样本。每批最多并发生成 6 条样本，进度分别统计排队中、生成中和已处理样本。创建批次后任务在后端后台运行，可通过以下接口查看运行状态和结果：
 
