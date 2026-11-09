@@ -558,6 +558,8 @@ function renderResultsView() {
         <label class="few-shot-option"><input id="experiment-few-shot" type="checkbox" checked /><span><strong>相似示例（Few-shot）</strong><small>最多附 2 个 development 示例（只含问题 + SQL）；运行 development 时自动关闭</small></span></label>
         <label class="few-shot-option"><input id="experiment-target-schema" type="checkbox" checked /><span><strong>提供目标题 Schema</strong><small>关闭后生成模型看不到目标表名、字段和外键；Few-shot 示例只有问题 + SQL</small></span></label>
         <label class="few-shot-option"><input id="experiment-query-planning" type="checkbox" /><span><strong>复杂问题先生成查询计划</strong><small>聚合/分组、比较/排名、多条件或嵌套问题触发；计划节点多调用一次模型</small></span></label>
+        <label class="few-shot-option"><input id="experiment-plan-validation" type="checkbox" /><span><strong>计划后置校验（需先开计划）</strong><small>校验计划是否漏条件或凭空加表，发现问题就把结论回喂给计划器修复一次</small></span></label>
+        <label class="few-shot-option"><input id="experiment-plan-distinct" type="checkbox" /><span><strong>计划 DISTINCT 检查（需先开计划）</strong><small>问题问“哪些/有没有”时，要求计划标记去重并在生成时提示使用 DISTINCT</small></span></label>
         <label class="few-shot-option"><input id="experiment-langgraph" type="checkbox" checked /><span><strong>LangGraph 质控流程</strong><small>关闭后用等价的顺序循环执行同样的节点，便于对比编排本身的影响</small></span></label>
         <label class="few-shot-option"><input id="experiment-sql-validation" type="checkbox" /><span><strong>SQL 执行校验与自动修复</strong><small>不调用评分模型；报错、0 行或全 NULL 时带错误信息重试（共用下方“最多修订次数”）</small></span></label>
         </div>
@@ -584,7 +586,7 @@ const experimentStatusLabels = {
   queued: '排队中', running: '运行中', completed: '已完成', cancelled: '已停止', failed: '运行失败',
 }
 const evaluationStatusLabels = {
-  correct: '结果一致', incorrect: '结果不一致', unjudged: '无法判定', generation_failed: '生成失败', interrupted: '运行中断', not_run: '未运行', pending: '待运行', queued: '排队中', generating: '生成中',
+  correct: '结果一致', incorrect: '结果不一致', empty_match: '空结果（不计分）', unjudged: '无法判定', generation_failed: '生成失败', interrupted: '运行中断', not_run: '未运行', pending: '待运行', queued: '排队中', generating: '生成中',
 }
 
 function renderExperimentRunList() {
@@ -642,7 +644,7 @@ function renderFullTestProblemCategories(data) {
     return `<tr><th scope="row">${esc(category.title || category.category)}</th><td>${cell(current)}</td>${runB ? `<td>${cell(older)}</td><td class="${deltaClass}">${deltaLabel}</td>` : ''}</tr>`
   }).join('')
   const runHeader = (run) => `<strong>${esc(run.run_id)}</strong><small>${esc(run.model)} · ${esc(formatDate(run.created_at))}</small>`
-  const runMetric = (run, label) => `<div class="category-run-metric"><span>${label} · 执行一致率</span><strong>${run.accuracy == null ? '—' : `${(run.accuracy * 100).toFixed(2)}%`}</strong><small>${fmt(run.counts?.incorrect || 0)} 错误 · ${fmt(run.counts?.unjudged || 0)} 无法判定 · ${fmt(run.counts?.generation_failed || 0)} 生成失败</small></div>`
+  const runMetric = (run, label) => `<div class="category-run-metric"><span>${label} · 执行一致率</span><strong>${run.accuracy == null ? '—' : `${(run.accuracy * 100).toFixed(2)}%`}</strong><small>${fmt(run.counts?.incorrect || 0)} 错误 · ${fmt(run.counts?.empty_match || 0)} 空结果 · ${fmt(run.counts?.unjudged || 0)} 无法判定 · ${fmt(run.counts?.generation_failed || 0)} 生成失败</small></div>`
   const tableEmpty = runB ? '这两个批次都没有诊断到问题类别。' : '这一批次没有诊断到问题类别。'
   const tableColumns = `<th>问题类别</th><th>${runHeader(runA)}<small>错误 / 无法判定 / 生成失败</small></th>${runB ? `<th>${runHeader(runB)}<small>错误 / 无法判定 / 生成失败</small></th><th>批次 A − 批次 B</th>` : ''}`
   const emptyRow = `<tr><td colspan="${runB ? 4 : 2}">${tableEmpty}</td></tr>`
@@ -679,7 +681,7 @@ function renderExperimentSummary() {
     return
   }
   const counts = run.counts || {}
-  const processed = (counts.correct || 0) + (counts.incorrect || 0) + (counts.unjudged || 0) + (counts.generation_failed || 0) + (counts.interrupted || 0)
+  const processed = (counts.correct || 0) + (counts.incorrect || 0) + (counts.empty_match || 0) + (counts.unjudged || 0) + (counts.generation_failed || 0) + (counts.interrupted || 0)
   const progress = run.total_count ? Math.min(100, Math.round(processed / run.total_count * 100)) : 0
   const accuracy = run.accuracy == null ? '—' : `${(run.accuracy * 100).toFixed(1)}%`
   const fewShotLabel = run.parameters?.few_shot_enabled
@@ -701,7 +703,7 @@ function renderExperimentSummary() {
     <section class="experiment-summary panel">
       <div class="experiment-summary-top"><div><div class="eyebrow">${esc(splitLabels[run.split] || run.split)} · ${esc(run.run_id)}</div><h2>${esc(run.model)}</h2><p>Prompt ${esc(run.prompt_version)} · Few-shot ${fewShotLabel} · 目标题 Schema ${targetSchemaLabel} · ${run.full_dataset ? '全量样本' : `${fmt(run.total_count)} 条固定抽样`} · 并发 ${fmt(run.parameters?.concurrency ?? 1)} 路 · temperature=${esc(run.parameters?.temperature ?? 0)} · max_tokens=${esc(run.parameters?.max_tokens ?? 2048)} · ${esc(formatDate(run.created_at))}</p></div><div class="experiment-summary-actions"><span class="run-state state-${esc(run.status)}">${esc(experimentStatusLabels[run.status] || run.status)}</span>${['queued', 'running'].includes(run.status) ? `<button class="outline-button" data-action="cancel-experiment" data-run-id="${esc(run.run_id)}">停止运行</button>` : ''}</div></div>
       <div class="experiment-progress"><span style="width:${progress}%"></span></div><div class="experiment-progress-caption"><span>${fmt(processed)} / ${fmt(run.total_count)} 条已处理</span><span class="experiment-progress-live"><span>排队中 ${fmt(counts.queued)}</span><span>生成中 ${fmt(counts.generating)}</span></span><span>${progress}%</span></div>
-      <div class="experiment-metrics"><div><span>结果一致</span><strong>${fmt(counts.correct)}</strong></div><div><span>结果不一致</span><strong>${fmt(counts.incorrect)}</strong></div><div><span>无法判定</span><strong>${fmt(counts.unjudged)}</strong></div><div><span>生成失败</span><strong>${fmt(counts.generation_failed)}</strong></div><div><span>运行中断</span><strong>${fmt(counts.interrupted)}</strong></div><div><span>未运行</span><strong>${fmt(counts.not_run)}</strong></div><div><span>待运行</span><strong>${fmt(counts.pending)}</strong></div><div><span>执行准确率</span><strong>${accuracy}</strong><small>仅在可判定样本中计算</small></div></div>
+      <div class="experiment-metrics"><div><span>结果一致</span><strong>${fmt(counts.correct)}</strong></div><div><span>结果不一致</span><strong>${fmt(counts.incorrect)}</strong></div><div><span>空结果（不计分）</span><strong>${fmt(counts.empty_match)}</strong></div><div><span>无法判定</span><strong>${fmt(counts.unjudged)}</strong></div><div><span>生成失败</span><strong>${fmt(counts.generation_failed)}</strong></div><div><span>运行中断</span><strong>${fmt(counts.interrupted)}</strong></div><div><span>未运行</span><strong>${fmt(counts.not_run)}</strong></div><div><span>待运行</span><strong>${fmt(counts.pending)}</strong></div><div><span>执行准确率</span><strong>${accuracy}</strong><small>仅计结果一致/不一致，空结果与无法判定不计入</small></div></div>
       ${qualityReport}
       <section class="experiment-optimization-log"><div class="optimization-log-heading"><strong>本轮优化记录</strong><span>随批次保存</span></div>${optimizationLog.length ? `<ul>${optimizationLog.map((entry) => `<li class="${entry.applied ? 'applied' : 'not-applied'}"><span class="optimization-log-state">${entry.applied ? '已启用' : '未启用'}</span><div><strong>${esc(entry.title || entry.id || '优化项')}</strong><small>${esc(entry.detail || '')}</small></div></li>`).join('')}</ul>` : '<p class="optimization-log-empty">该历史批次未保存结构化优化记录。</p>'}${optimizationNote ? `<div class="optimization-log-note"><strong>备注</strong><p>${esc(optimizationNote)}</p></div>` : ''}</section>
       ${run.error_message ? `<div class="experiment-run-error">${esc(run.error_message)}</div>` : ''}
@@ -1054,6 +1056,8 @@ async function startExperiment() {
         use_few_shot: document.querySelector('#experiment-few-shot')?.checked ?? true,
         use_target_schema: document.querySelector('#experiment-target-schema')?.checked ?? true,
         use_query_planning: document.querySelector('#experiment-query-planning')?.checked ?? false,
+        plan_validation: document.querySelector('#experiment-plan-validation')?.checked ?? false,
+        plan_distinct_guard: document.querySelector('#experiment-plan-distinct')?.checked ?? false,
         use_sql_validation: document.querySelector('#experiment-sql-validation')?.checked ?? false,
         use_langgraph: document.querySelector('#experiment-langgraph')?.checked ?? true,
         use_quality_scoring: document.querySelector('#experiment-quality-scoring')?.checked ?? false,

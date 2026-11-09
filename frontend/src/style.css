@@ -449,6 +449,7 @@ button:disabled { cursor: not-allowed !important; opacity: .38; }
 .evaluation-badge.eval-incorrect, .evaluation-badge.eval-generation_failed { background: #fff0ed; color: #a75951; }
 .evaluation-badge.eval-interrupted, .evaluation-badge.eval-not_run { background: #f0f1f4; color: #697586; }
 .evaluation-badge.eval-unjudged { background: #fff5e6; color: #9b733f; }
+.evaluation-badge.eval-empty_match { background: #eef2f7; color: #5d6b7e; }
 .evaluation-badge.eval-generating, .evaluation-badge.eval-queued, .evaluation-badge.eval-pending { background: #f0efff; color: #6a61c1; }
 .experiment-item-detail { min-width: 0; display: grid; gap: 10px; }
 .review-detail-header { padding: 14px; }

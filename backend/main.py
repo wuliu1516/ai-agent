@@ -25,6 +25,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from .fewshot import FewShotRetriever
+from .literal_filter import excluded_indices as gold_literal_exclusions
+from .planner import (
+    QUERY_PLAN_SYSTEM_PROMPT,
+    QUERY_PLANNING_VERSION,
+    QueryPlan,
+    build_plan_repair_prompt,
+    build_prompt_with_query_plan,
+    build_query_plan_prompt,
+    normalize_query_plan,
+    plan_from_model,
+    plan_warnings,
+    validate_plan,
+)
 from .llm import FatalModelServiceError, ModelGateway
 from .quality import (
     QUALITY_RUBRIC_SYSTEM_PROMPT,
@@ -69,12 +82,10 @@ RESULT_PREVIEW_ROWS = 12
 FEWSHOT_EXAMPLE_COUNT = 2
 FEWSHOT_RETRIEVAL_VERSION = "bm25-char-ngrams-v4-structural"
 FEWSHOT_LEGACY_VERSION = "bm25-char-ngrams-v3-question-sql-only"
-QUERY_PLANNING_VERSION = "complex-query-plan-v3-structured"
+SEMANTIC_SQL_GUIDE_VERSION = "semantic-grounding-guide-v1"
 # 候选选择余量：修订版分数要高出这么多才替换初版，避免评分噪声把正确结果换掉。
 SELECTION_MARGIN = 10
 GENERATION_PARAMS = {"temperature": 0, "max_tokens": 2048}
-QUERY_PLAN_SYSTEM_PROMPT = """你是一个 Text-to-SQL 查询规划器。根据用户问题和目标 Schema，整理生成 SQL 所需的结构化计划。
-只输出一个 JSON 对象，字段必须包含 target_fields、filters、tables_and_joins、aggregation_grouping、sorting_limit。每个字段用简短字符串或字符串数组表达；没有相关内容时用空字符串或空数组。不要输出 SQL、Markdown 或解释。严格依据问题和 Schema；不确定时明确写出不确定，不要臆造表、字段、值或关联关系。"""
 BASELINE_SYSTEM_PROMPT = """你是一个严谨的 Text-to-SQL 助手。请根据用户的问题和给出的数据库结构生成 SQL。
 必须遵循以下规则：
 1. 只使用提供的表名和字段名，不要臆造数据库结构。
@@ -83,6 +94,13 @@ BASELINE_SYSTEM_PROMPT = """你是一个严谨的 Text-to-SQL 助手。请根据
 4. 最终答复只能是一条 SQL 语句；不要输出推理过程、分析说明或任何 <think> / </think> 标记。
 5. SELECT 只包含回答问题所需的字段，不要额外添加姓名、ID 或描述列。
 6. 不要使用 Markdown 代码围栏，不要添加“SQL:”等前后缀文字，也不要输出多条语句。"""
+
+SEMANTIC_SQL_GUIDE = """在生成 SQL 前按问题核对以下要点；仅根据当前问题和目标 Schema 推断，不要照搬示例里的表名、字段名或字面值：
+- 结果粒度：返回明细还是按某个实体分组？若分组，明确分组实体；SELECT 的非聚合列应与该实体一致。
+- 聚合对象：问题要数的是实体、关系记录还是事件？避免用明细行数替代去重实体数，也避免漏掉需要的关联表。
+- 否定/集合：对“没有、未、不包括、除了”等问题，先确定候选全集与排除集合；确认子查询按正确实体键关联。
+- 语义字段与排序：选择真正回答问题的字段；“最近/最早/最高/最低”应按对应业务属性排序，不要把相关但不同含义的列混用。
+- 连接路径：多表查询沿目标 Schema 的外键关系连接，并检查连接是否改变结果粒度或造成重复。"""
 
 
 def public_table_count(schema: dict[str, Any]) -> int:
@@ -412,7 +430,11 @@ class ExperimentInput(BaseModel):
     few_shot_mode: str = Field(default="structural", pattern="^(structural|legacy)$")
     few_shot_examples: int = Field(default=2, ge=1, le=6)
     use_target_schema: bool = True
+    exclude_gold_literal_mismatch: bool = True
     use_query_planning: bool = False
+    plan_validation: bool = False
+    plan_repair_limit: int = Field(default=1, ge=0, le=2)
+    plan_distinct_guard: bool = False
     use_sql_validation: bool = False
     use_quality_scoring: bool = False
     use_langgraph: bool = True
@@ -496,6 +518,7 @@ def build_prompt(
     prompt_sections.append(
         f"{target_context}SQL dialect: SQLite\n"
         f"{schema_context}Question:\n{question}\n\n"
+        f"Semantic SQL checklist:\n{SEMANTIC_SQL_GUIDE}\n\n"
         "Return one SQLite SELECT query only."
     )
     user_prompt = "\n\n".join(prompt_sections)
@@ -524,61 +547,6 @@ def complex_query_reasons(question: str) -> list[str]:
 
 def should_plan(reasons: list[str]) -> bool:
     return len(reasons) >= MIN_COMPLEX_REASONS or bool(STRONG_COMPLEX_REASONS & set(reasons))
-
-
-class QueryPlan(BaseModel):
-    target_fields: list[str] = Field(default_factory=list, description="SELECT 中只应出现的、回答问题所需的列或表达式")
-    filters: list[str] = Field(default_factory=list, description="WHERE/HAVING 条件，字面值必须与问题原文一致")
-    tables_and_joins: list[str] = Field(default_factory=list, description="需要的表及 JOIN 条件（遵循外键）")
-    aggregation_grouping: list[str] = Field(default_factory=list, description="聚合函数、GROUP BY；无则留空")
-    sorting_limit: list[str] = Field(default_factory=list, description="ORDER BY 与 LIMIT；无则留空")
-
-
-QUERY_PLAN_KEYS = tuple(QueryPlan.model_fields)
-
-
-def build_query_plan_prompt(user_prompt: str) -> str:
-    context = re.sub(
-        r"\s*Return one SQLite SELECT query only\.?\s*$",
-        "",
-        user_prompt,
-        flags=re.IGNORECASE,
-    ).rstrip()
-    return (
-        f"{context}\n\n"
-        "请先整理查询计划，不要生成 SQL。字段含义：target_fields 只列回答问题必需的列；filters 中的字面值照抄问题原文；"
-        "tables_and_joins 只列必要的表并遵循外键；aggregation_grouping、sorting_limit 没有则留空数组。"
-    )
-
-
-def normalize_query_plan(raw_plan: str) -> dict[str, Any]:
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_plan.strip(), flags=re.IGNORECASE)
-    match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-    if match:
-        try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, dict) and isinstance(parsed.get("query_plan"), dict):
-                parsed = parsed["query_plan"]
-            if isinstance(parsed, dict) and any(key in parsed for key in QUERY_PLAN_KEYS):
-                fields: dict[str, Any] = {}
-                for key in QUERY_PLAN_KEYS:
-                    value = parsed.get(key, [])
-                    if value is None:
-                        value = []
-                    fields[key] = value if isinstance(value, (str, list)) else str(value)
-                return fields
-        except (json.JSONDecodeError, TypeError, ValueError):
-            pass
-    return {"raw_plan": cleaned[:6_000]}
-
-
-def build_prompt_with_query_plan(user_prompt: str, query_plan: dict[str, Any]) -> str:
-    return (
-        f"{user_prompt}\n\n"
-        "查询计划（由模型整理，仅供参考；若与问题或 Schema 不一致，以问题和 Schema 为准）：\n"
-        f"{json.dumps(query_plan, ensure_ascii=False, indent=2)}\n\n"
-        "根据问题、目标 Schema 和上述计划生成 SQL；再次核对字段、过滤值、连接条件、聚合与排序，只输出一条 SQLite SELECT。"
-    )
 
 
 MODEL_GATEWAY = ModelGateway(
@@ -835,6 +803,14 @@ def evaluate_generated_sql(
     else:
         equal = Counter(predicted_rows) == Counter(gold_rows)
     if equal:
+        if not gold_rows:
+            # 金标为空、生成 SQL 也为空：空集与空集恒相等，这条判定不携带任何信息，
+            # 单独归类为 empty_match 且不计入正确率，否则所有 A/B 对比都被它稀释。
+            return "empty_match", [{
+                "category": "empty_match",
+                "title": "空结果 vs 空金标（不计入正确率）",
+                "evidence": "生成 SQL 与金标 SQL 都返回 0 行。这种一致无法区分“查询正确”与“写错但同样为空”，因此单独归类。",
+            }], result_summary(prediction), result_summary(reference), {"ordered": ordered, "predicted_row_count": 0, "gold_row_count": 0, "row_match": {"equal": True}, "empty_match": True}
         note = "预测与金标的查询结果一致。此判定只说明在当前数据库实例上执行结果一致。"
         return "correct", [{"category": "match", "title": "执行结果一致", "evidence": f"{len(predicted_rows)} 行；{'保留排序' if ordered else '忽略行顺序并保留重复行'}比较。{note}"}], result_summary(prediction), result_summary(reference), {"ordered": ordered, "predicted_row_count": len(predicted_rows), "gold_row_count": len(gold_rows), "row_match": {"equal": True}}
     row_match: dict[str, Any]
@@ -1079,6 +1055,7 @@ def experiment_summary(run_id: str, include_prompt: bool = False) -> dict[str, A
         "counts": {
             "correct": correct,
             "incorrect": incorrect,
+            "empty_match": status_counts.get("empty_match", 0),
             "unjudged": status_counts.get("unjudged", 0),
             "generation_failed": status_counts.get("generation_failed", 0),
             "interrupted": status_counts.get("interrupted", 0),
@@ -1182,6 +1159,9 @@ class SQLReviewGraphState(TypedDict, total=False):
     started_at: float
     generation_error: str
     fatal: bool
+    plan_validation: bool
+    plan_repair_limit: int
+    plan_distinct_guard: bool
     result: dict[str, Any]
 
 
@@ -1192,30 +1172,64 @@ def _sql_review_route_start(state: SQLReviewGraphState) -> str:
 
 def _sql_review_plan(state: SQLReviewGraphState) -> dict[str, Any]:
     started = time.monotonic()
+    question = state["question"]
     planner_prompt = build_query_plan_prompt(state["user_prompt"])
-    snapshot = {"system": QUERY_PLAN_SYSTEM_PROMPT, "user": planner_prompt}
+    prompt_snapshot = {"system": QUERY_PLAN_SYSTEM_PROMPT, "user": planner_prompt}
+    repair_snapshots: list[dict[str, str]] = []
+    plan: dict[str, Any] = {}
+    errors: list[str] = []
+    repair_used = 0
     try:
         plan = MODEL_GATEWAY.structured(
             state["model"],
             QueryPlan,
             QUERY_PLAN_SYSTEM_PROMPT,
             planner_prompt,
-            from_model=lambda parsed: parsed.model_dump(),
+            from_model=plan_from_model,
             from_text=normalize_query_plan,
             max_tokens=700,
         )
+        # 后置校验 + 一次定向修复：把校验结论回喂给计划器，而不是直接丢给生成模型。
+        if state.get("plan_validation") and "raw_plan" not in plan:
+            for _ in range(state.get("plan_repair_limit", 0)):
+                errors = validate_plan(question, plan)
+                if not errors:
+                    break
+                repair_prompt = build_plan_repair_prompt(state["user_prompt"], plan, errors)
+                repair_snapshots.append({"system": QUERY_PLAN_SYSTEM_PROMPT, "user": repair_prompt})
+                repaired = MODEL_GATEWAY.structured(
+                    state["model"],
+                    QueryPlan,
+                    QUERY_PLAN_SYSTEM_PROMPT,
+                    repair_prompt,
+                    from_model=plan_from_model,
+                    from_text=normalize_query_plan,
+                    max_tokens=700,
+                )
+                repair_used += 1
+                if "raw_plan" in repaired:
+                    break
+                plan = repaired
         elapsed_ms = round((time.monotonic() - started) * 1000, 2)
         query_plan = {
             **state.get("query_plan", {}),
             "status": "generated_unstructured" if "raw_plan" in plan else "generated",
             "plan": plan,
+            "validation_errors": errors,
+            "repair_used": repair_used,
             "latency_ms": elapsed_ms,
-            "planner_prompt": snapshot,
+            "planner_prompt": prompt_snapshot,
+            "repair_prompts": repair_snapshots,
         }
-        # 非结构化的原始计划容易误导生成，直接回退到无计划提示词。
-        generation_prompt = (
-            state["user_prompt"] if "raw_plan" in plan else build_prompt_with_query_plan(state["user_prompt"], plan)
-        )
+        if "raw_plan" in plan:
+            # 非结构化的原始计划容易误导生成，直接回退到无计划提示词。
+            generation_prompt = state["user_prompt"]
+        else:
+            generation_prompt = build_prompt_with_query_plan(state["user_prompt"], plan)
+            if state.get("plan_distinct_guard") and plan.get("distinct"):
+                generation_prompt += (
+                    "\n\n计划标记本题结果需要去重：若连接可能放大行数，请在 SELECT 中使用 DISTINCT。"
+                )
     except Exception as error:
         elapsed_ms = round((time.monotonic() - started) * 1000, 2)
         query_plan = {
@@ -1223,7 +1237,7 @@ def _sql_review_plan(state: SQLReviewGraphState) -> dict[str, Any]:
             "status": "failed_fallback",
             "error": f"{type(error).__name__}: {str(error)[:800]}",
             "latency_ms": elapsed_ms,
-            "planner_prompt": snapshot,
+            "planner_prompt": prompt_snapshot,
         }
         generation_prompt = state["user_prompt"]
     return {
@@ -1561,6 +1575,9 @@ def generate_and_evaluate_experiment_item(run: sqlite3.Row, item: sqlite3.Row) -
             "validation_enabled": validation_enabled,
             "scoring_enabled": scoring_enabled,
             "query_planning_enabled": query_planning_enabled,
+            "plan_validation": bool(parameters.get("plan_validation")) if query_planning_enabled else False,
+            "plan_repair_limit": int(parameters.get("plan_repair_limit", 1)) if query_planning_enabled else 0,
+            "plan_distinct_guard": bool(parameters.get("plan_distinct_guard")) if query_planning_enabled else False,
             "query_plan": query_plan,
             "retry_limit": retry_limit,
             "attempt_limit": retry_limit + 1 if quality_enabled else 1,
@@ -1831,23 +1848,31 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
         FEWSHOT_LEGACY_VERSION if body.few_shot_mode == "legacy" else FEWSHOT_RETRIEVAL_VERSION
     ) if few_shot_enabled else ""
     target_schema_enabled = body.use_target_schema
-    if body.sample_limit == 0 or body.sample_limit >= total_samples:
-        sample_indices = list(range(total_samples))
+    excluded = gold_literal_exclusions(body.split) if body.exclude_gold_literal_mismatch else {}
+    eligible = [index for index in range(total_samples) if index not in excluded]
+    if body.sample_limit == 0 or body.sample_limit >= len(eligible):
+        sample_indices = eligible
     else:
-        sample_indices = sorted(random.Random(body.sample_seed).sample(range(total_samples), body.sample_limit))
+        sample_indices = sorted(random.Random(body.sample_seed).sample(eligible, body.sample_limit))
     run_id = f"run-{uuid.uuid4().hex[:12]}"
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     prompt_fingerprint = json.dumps(
         {
             "system_prompt": system_prompt,
+            "semantic_sql_guide_version": SEMANTIC_SQL_GUIDE_VERSION,
             "few_shot_enabled": few_shot_enabled,
             "few_shot_count": few_shot_count,
             "few_shot_source_split": "development" if few_shot_enabled else "",
             "few_shot_retrieval_version": few_shot_retrieval_version,
             "few_shot_mode": body.few_shot_mode if few_shot_enabled else "",
             "target_schema_enabled": target_schema_enabled,
+            "exclude_gold_literal_mismatch": body.exclude_gold_literal_mismatch,
+            "excluded_samples": len(excluded),
             "query_planning": body.use_query_planning,
             "query_planning_version": QUERY_PLANNING_VERSION if body.use_query_planning else "",
+            "plan_validation": body.plan_validation if body.use_query_planning else False,
+            "plan_repair_limit": body.plan_repair_limit if body.use_query_planning else 0,
+            "plan_distinct_guard": body.plan_distinct_guard if body.use_query_planning else False,
             "sql_validation": use_validation,
             "langgraph": body.use_langgraph,
             "quality_scoring": body.use_quality_scoring,
@@ -1874,20 +1899,33 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
         "few_shot_retrieval_version": few_shot_retrieval_version,
         "few_shot_mode": body.few_shot_mode if few_shot_enabled else "",
         "target_schema_enabled": target_schema_enabled,
+        "exclude_gold_literal_mismatch": body.exclude_gold_literal_mismatch,
+        "excluded_gold_literal_mismatch": len(excluded),
+        "eligible_samples": len(eligible),
         "query_planning": body.use_query_planning,
         "query_planning_version": QUERY_PLANNING_VERSION if body.use_query_planning else "",
+        "plan_validation": body.plan_validation if body.use_query_planning else False,
+        "plan_repair_limit": body.plan_repair_limit if body.use_query_planning else 0,
+        "plan_distinct_guard": body.plan_distinct_guard if body.use_query_planning else False,
         "quality_scoring": body.use_quality_scoring,
         "quality_rubric_version": QUALITY_RUBRIC_VERSION if body.use_quality_scoring else "",
         "quality_score_threshold": body.quality_score_threshold,
         "quality_retry_limit": body.quality_retry_limit if use_validation else 0,
         "quality_judge_model": quality_judge_model if body.use_quality_scoring else "",
         "optimization_note": body.optimization_note.strip(),
+        "semantic_sql_guide_version": SEMANTIC_SQL_GUIDE_VERSION,
         "optimization_log": [
             {
                 "id": "select-projection-v1",
                 "title": "精简 SELECT 字段",
                 "applied": True,
                 "detail": "提示词要求只返回回答问题所需的字段，减少额外投影列。",
+            },
+            {
+                "id": SEMANTIC_SQL_GUIDE_VERSION,
+                "title": "语义字段、集合逻辑与聚合粒度核对",
+                "applied": True,
+                "detail": "生成前明确结果粒度与计数对象；针对否定条件区分目标集和排除集；核对排序字段语义与外键连接路径。规则只使用问题和目标 Schema，不使用当前样本金标。",
             },
             {
                 "id": few_shot_retrieval_version or FEWSHOT_RETRIEVAL_VERSION,
@@ -1918,6 +1956,18 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
                 ),
             },
             {
+                "id": "gold-literal-filter-v1",
+                "title": "剔除金标字面值不匹配样本",
+                "applied": body.exclude_gold_literal_mismatch,
+                "detail": (
+                    f"本轮从 {body.split} 集剔除 {len(excluded)} 条样本：其金标 SQL 的取值（如 course_name = '英语'）"
+                    "在目标库中不存在（库里存的是 English）。这类样本金标必返 0 行，会把“照抄中文值”误判为正确、"
+                    "把“写出库中真实英文值”误判为错误，因此不计入测评。"
+                    if body.exclude_gold_literal_mismatch
+                    else "本轮未启用；字面值不匹配样本一并参与测评。"
+                ),
+            },
+            {
                 "id": "target-schema-context-v1",
                 "title": "目标题 Schema 上下文",
                 "applied": target_schema_enabled,
@@ -1932,7 +1982,13 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
                 "title": "复杂问题查询计划节点",
                 "applied": body.use_query_planning,
                 "detail": (
-                    "遇到聚合/分组、比较/排名、多条件组合或嵌套/排除提示时，先生成包含目标字段、过滤、表与连接、聚合/分组、排序/数量限制的 JSON 计划，再将计划交给 SQL 生成节点；计划失败时回退直接生成。"
+                    "遇到聚合/分组、比较/排名、多条件组合或嵌套/排除提示时，先生成结构化 JSON 计划再交给 SQL 生成节点；计划失败时回退直接生成。"
+                    + (
+                        f"已启用计划后置校验（最多修复 {body.plan_repair_limit} 次）；"
+                        if body.plan_validation
+                        else "未启用计划后置校验；"
+                    )
+                    + ("已启用 DISTINCT 检查。" if body.plan_distinct_guard else "未启用 DISTINCT 检查。")
                     if body.use_query_planning
                     else "本轮未启用；可通过批次配置单独打开。"
                 ),
@@ -1991,6 +2047,7 @@ def create_experiment(body: ExperimentInput, background_tasks: BackgroundTasks) 
                 record.get("question", ""),
                 few_shot_count=few_shot_count,
                 include_target_schema=target_schema_enabled,
+                few_shot_mode=body.few_shot_mode,
             )
             prompt_snapshot = json.dumps(
                 {"messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]},

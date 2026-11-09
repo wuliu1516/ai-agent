@@ -1,0 +1,12 @@
+{
+  "cspider_nl2sql_train": {
+    "file_name": "train.jsonl",
+    "formatting": "alpaca",
+    "columns": {"prompt": "instruction", "query": "input", "response": "output"}
+  },
+  "cspider_nl2sql_validation": {
+    "file_name": "validation.jsonl",
+    "formatting": "alpaca",
+    "columns": {"prompt": "instruction", "query": "input", "response": "output"}
+  }
+}
