@@ -52,6 +52,10 @@ Makefile 的配方中不要直接写中文：Windows 版 make 会按系统码页
 - 原始 CSpider JSON 与各数据库 SQLite 文件不被修改。NL2SQL 生成记录单独写入 `backend/storage/workbench.sqlite3`；可用 `NL2SQL_STATE_DB` 指定保存位置。
 - 前端 API 跨域来源默认允许 Vite 开发/预览地址；部署到其他域名时，可通过 `NL2SQL_CORS_ORIGINS` 设置逗号分隔的允许来源。
 
+### 批量运行审阅
+
+![批量运行审阅页长截图](docs/images/batch-review-long.png)
+
 ## 金标 SQL 来源
 
 样本详情页使用对应 JSON 记录内的 `query` 字段作为金标 SQL，保证问题、数据库和参考 SQL 来自同一条标注。仓库中的 `development_gold.sql` 与 `validation_gold.sql` 行数虽与 JSON 相同，但部分行尾 `db_id` 和同序号 JSON 记录不一致；因此不把这两份文件直接按行号挂到样本上。原始文件保持不变。
