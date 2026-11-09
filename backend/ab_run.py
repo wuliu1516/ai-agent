@@ -13,7 +13,7 @@ LIMIT = int(sys.argv[2]) if len(sys.argv) > 2 else 120
 SPLIT = sys.argv[3] if len(sys.argv) > 3 else "validation"
 COMMON = {
     "split": SPLIT,
-    "model": "Qwen3.8-27B-FB8",
+    "model": "Qwen3.8-27B-FP8",
     "sample_limit": LIMIT,
     "sample_seed": 7,
     "use_target_schema": True,
